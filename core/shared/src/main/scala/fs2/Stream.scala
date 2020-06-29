@@ -509,6 +509,24 @@ final class Stream[+F[_], +O] private[fs2] (private val free: FreeC[F, O, Unit])
   def collectWhile[O2](pf: PartialFunction[O, O2]): Stream[F, O2] =
     takeWhile(pf.isDefinedAt).map(pf)
 
+  def collectF[F2[x] >: F[x], O2](pf: PartialFunction[O, F2[O2]]): Stream[F2, O2] =
+    filter(pf.isDefinedAt).evalMap(pf)
+
+  def collectFirstF[F2[x] >: F[x], O2](pf: PartialFunction[O, F2[O2]]): Stream[F2, O2] =
+    this.find(pf.isDefinedAt).evalMap(pf)
+
+  def collectWhileF[F2[x] >: F[x], O2](pf: PartialFunction[O, F2[O2]]): Stream[F2, O2] =
+    takeWhile(pf.isDefinedAt).evalMap(pf)
+
+  def collectFAsync[F2[x] >: F[x], O2](maxConcurrency: Int)(pf: PartialFunction[O, F2[O2]]): Stream[F2, O2] =
+    filter(pf.isDefinedAt).parEvalMap(maxConcurrency)(pf)
+
+  def collectFirstFAsync[F2[x] >: F[x], O2](maxConcurrency: Int)(pf: PartialFunction[O, F2[O2]]): Stream[F2, O2] =
+    this.find(pf.isDefinedAt).parEvalMap(maxConcurrency)(pf)
+
+  def collectWhileFAsync[F2[x] >: F[x], O2](maxConcurrency: Int)(pf: PartialFunction[O, F2[O2]]): Stream[F2, O2] =
+    takeWhile(pf.isDefinedAt).parEvalMap(maxConcurrency)(pf)
+
   /**
     * Gets a projection of this stream that allows converting it to an `F[..]` in a number of ways.
     *
