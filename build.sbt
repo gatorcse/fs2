@@ -596,7 +596,7 @@ lazy val io = crossProject(JVMPlatform, JSPlatform, NativePlatform)
     )
   )
 
-// Pooled native buffers for the JVM (FFM, JDK 22+) and Scala Native.
+// Pooled native buffers for the JVM (FFM, JDK 25+) and Scala Native.
 // Not aggregated into `root`, so the main CI matrix (JDK 17 and 21) is unaffected;
 // the `buffer` workflow job below builds it on JDK 25.
 lazy val buffer = crossProject(JVMPlatform, NativePlatform)
@@ -615,7 +615,7 @@ lazy val buffer = crossProject(JVMPlatform, NativePlatform)
     )
   )
   .jvmSettings(
-    tlJdkRelease := Some(22),
+    tlJdkRelease := Some(25),
     Test / fork := true
   )
 
@@ -628,7 +628,7 @@ lazy val bufferBenchmark = project
   .disablePlugins(DoctestPlugin)
   .settings(
     name := "fs2-buffer-benchmark",
-    tlJdkRelease := Some(22)
+    tlJdkRelease := Some(25)
   )
   .dependsOn(bufferJVM)
 
