@@ -42,7 +42,10 @@ import scala.concurrent.duration._
   *     magazine that owns its page.
   *   - Empty pages return to their slab, and slabs that stay entirely free for
   *     [[BufferAllocator.Config.idleTimeout]] go back to the OS, so memory shrinks after a
-  *     spike. Trimming runs opportunistically as pages are retired, and on [[trim]].
+  *     spike. Trimming runs opportunistically when a page is retired, but a slab that went
+  *     idle with no later retirement, and pages left in the shared pool by closed
+  *     magazines, are only returned by [[trim]]. Call it periodically, for example from a
+  *     poller tick; nothing in the allocator runs on a timer.
   *
   * Buffers above [[SizeClass.MaxPooled]] are allocated directly and freed on release.
   */

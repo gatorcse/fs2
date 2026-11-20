@@ -60,7 +60,7 @@ final class Magazine private[buffer] (val allocator: BufferAllocator) {
         p = refill(cls)
         slot = p.allocateSlot()
       }
-      p.slab.memory.buf(p.slotOffset(slot), size, p.slotSize, p, slot)
+      p.slab.memory.buf(p.slotOffset(slot), size, p.slotSize, p, slot, p.beginLease(slot))
     }
   }
 

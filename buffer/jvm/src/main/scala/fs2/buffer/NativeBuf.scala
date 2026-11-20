@@ -44,11 +44,14 @@ final class NativeBuf private[buffer] (
     val capacity: Int,
     private[buffer] val page: Page,
     private[buffer] val slot: Int,
+    private[buffer] val gen: Int,
     private[buffer] val root: NativeBuf,
     private[this] val arena: Arena
 ) {
 
-  private[this] var released = false
+  /** The lease state for unpooled buffers; pooled ones use their page's generations. */
+  private[this] val unpooledLease: java.util.concurrent.atomic.AtomicBoolean =
+    if ((page eq null) && (root eq null)) new java.util.concurrent.atomic.AtomicBoolean else null
 
   /** Length in bytes. */
   val size: Int = segment.byteSize().toInt
@@ -58,8 +61,13 @@ final class NativeBuf private[buffer] (
 
   def isSlice: Boolean = root ne null
 
-  /** Whether the lease has been released. A slice reports its root's state. */
-  def isReleased: Boolean = if (root eq null) released else root.isReleased
+  /** Whether the lease has been released. Exact from any thread. A slice reports its
+    * root's state.
+    */
+  def isReleased: Boolean =
+    if (root ne null) root.isReleased
+    else if (page ne null) !page.isLive(slot, gen)
+    else unpooledLease.get()
 
   def getByte(index: Int): Byte = SegmentAccess.getByte(segment, index.toLong)
   def putByte(index: Int, value: Byte): Unit = SegmentAccess.putByte(segment, index.toLong, value)
@@ -126,6 +134,7 @@ final class NativeBuf private[buffer] (
       length,
       null,
       -1,
+      0,
       if (root eq null) this else root,
       null
     )
@@ -139,8 +148,9 @@ final class NativeBuf private[buffer] (
   private[buffer] def markReleased(): Unit = {
     if (root ne null)
       throw new IllegalStateException("a slice cannot be released; release its root")
-    if (released) throw new IllegalStateException("buffer already released")
-    released = true
+    val ended =
+      if (page ne null) page.endLease(slot, gen) else unpooledLease.compareAndSet(false, true)
+    if (!ended) throw new IllegalStateException(s"$this already released")
   }
 
   private[buffer] def freeUnpooled(): Unit = arena.close()

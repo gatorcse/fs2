@@ -21,7 +21,7 @@
 
 package fs2.buffer
 
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicIntegerArray}
 
 /** A fixed-size run of a slab, carved into same-size slots of one size class.
   *
@@ -33,6 +33,13 @@ import java.util.concurrent.atomic.AtomicInteger
   *
   * Slots are linked through `next`, shared by both lists: a free slot is on exactly one
   * of them, and a slot in use is on neither.
+  *
+  * Each slot also has a generation in `gens`: odd while leased, even while free. A lease
+  * remembers the odd value it was given, and releasing it is a compare-and-set from that
+  * value to the next even one. So a buffer can be released only once, even by two threads
+  * at the same time, a stale buffer can never release a later lease of the same slot, and
+  * `isLive` is exact from any thread. The arrays are sized for the smallest class and kept
+  * across formats, so generations never restart while a stale buffer could hold the page.
   */
 private[buffer] final class Page(val slab: Slab, val index: Int, val offset: Long, val size: Int) {
 
@@ -41,7 +48,8 @@ private[buffer] final class Page(val slab: Slab, val index: Int, val offset: Lon
   var slotSize: Int = 0
   var capacity: Int = 0
   @volatile var owner: Magazine = null
-  private[this] var next: Array[Int] = Page.EmptyNext
+  private[this] val next: Array[Int] = new Array[Int](size / SizeClass.Small)
+  private[this] val gens = new AtomicIntegerArray(size / SizeClass.Small)
 
   // Owner-only state.
   private[this] var localHead: Int = -1
@@ -63,7 +71,6 @@ private[buffer] final class Page(val slab: Slab, val index: Int, val offset: Lon
     sizeClass = cls
     slotSize = ss
     capacity = size / ss
-    if (next.length < capacity) next = new Array[Int](capacity)
     localHead = -1
     fresh = 0
     used = 0
@@ -101,6 +108,21 @@ private[buffer] final class Page(val slab: Slab, val index: Int, val offset: Lon
     used += 1
     slot
   }
+
+  /** Owner only, right after `allocateSlot`: starts a lease of `slot` and returns its
+    * generation.
+    */
+  def beginLease(slot: Int): Int = {
+    val g = gens.get(slot) + 1
+    gens.lazySet(slot, g)
+    g
+  }
+
+  /** Any thread: ends the lease `gen` of `slot`. False if it already ended. */
+  def endLease(slot: Int, gen: Int): Boolean = gens.compareAndSet(slot, gen, gen + 1)
+
+  /** Any thread: whether lease `gen` of `slot` is still live. */
+  def isLive(slot: Int, gen: Int): Boolean = gens.get(slot) == gen
 
   /** Owner only: returns a slot to the local free list. */
   def freeLocal(slot: Int): Unit = {
@@ -150,8 +172,4 @@ private[buffer] final class Page(val slab: Slab, val index: Int, val offset: Lon
   def hasRemoteFree: Boolean = remoteHead.get() >= 0
 
   def slotOffset(slot: Int): Long = offset + slot.toLong * slotSize
-}
-
-private[buffer] object Page {
-  private val EmptyNext = new Array[Int](0)
 }

@@ -55,14 +55,14 @@ private[buffer] object Memory {
           arena.close()
           throw t
       }
-    new NativeBuf(segment.asSlice(0L, size.toLong), size, null, -1, null, arena)
+    new NativeBuf(segment.asSlice(0L, size.toLong), size, null, -1, 0, null, arena)
   }
 
   private final class JvmSlab(arena: Arena, segment: MemorySegment) extends SlabMemory {
     val size: Long = segment.byteSize()
     def address: Long = segment.address()
-    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int): NativeBuf =
-      new NativeBuf(segment.asSlice(offset, size.toLong), capacity, page, slot, null, null)
+    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int, gen: Int): NativeBuf =
+      new NativeBuf(segment.asSlice(offset, size.toLong), capacity, page, slot, gen, null, null)
     def free(): Unit = arena.close()
   }
 }

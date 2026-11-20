@@ -54,18 +54,19 @@ private[buffer] object Memory {
   def allocateUnpooled(size: Int): NativeBuf = {
     val p = stdlib.malloc(math.max(size, 1).toCSize)
     if (p == null) throw new OutOfMemoryError(s"malloc of $size bytes failed")
-    new NativeBuf(p, size, size, null, -1, null, true)
+    new NativeBuf(p, size, size, null, -1, 0, null, true)
   }
 
   def freeUnpooled(p: Ptr[Byte]): Unit = stdlib.free(p)
 
   private final class NativeSlab(base: Ptr[Byte], val size: Long) extends SlabMemory {
     def address: Long = base.toLong
-    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int): NativeBuf =
-      new NativeBuf(base + offset, size, capacity, page, slot, null, false)
-    def free(): Unit = {
-      mman.munmap(base, this.size.toCSize)
-      ()
-    }
+    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int, gen: Int): NativeBuf =
+      new NativeBuf(base + offset, size, capacity, page, slot, gen, null, false)
+    def free(): Unit =
+      if (mman.munmap(base, this.size.toCSize) != 0)
+        throw new IllegalStateException(
+          s"munmap of $size bytes failed: ${fromCString(string.strerror(errno.errno))}"
+        )
   }
 }
