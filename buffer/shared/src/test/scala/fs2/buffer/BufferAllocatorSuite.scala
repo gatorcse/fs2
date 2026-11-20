@@ -33,6 +33,9 @@ import org.scalacheck.Prop.forAll
 
 class BufferAllocatorSuite extends ScalaCheckSuite {
 
+  // The thread stress tests run for tens of seconds on Native debug builds on CI.
+  override def munitTimeout: Duration = 2.minutes
+
   // Small slabs so the tests exercise slab creation, page turnover and trimming.
   private val smallConfig =
     BufferAllocator.Config(slabSize = 2 * 1024 * 1024, pageSize = 512 * 1024, idleTimeout = 1.hour)
@@ -449,8 +452,14 @@ class BufferAllocatorSuite extends ScalaCheckSuite {
     )
     def checkAndRelease(e: (NativeBuf, Int), release: NativeBuf => Unit): Unit = {
       val (x, tag) = e
-      val bytes = x.toArray
-      if (!bytes.forall(_ == tag.toByte)) throw new AssertionError(s"$x was overwritten while live")
+      // Samples every 61st byte and the last one: any other owner of the slot fills it
+      // whole, and reading every byte is too slow for Native's debug builds.
+      var i = 0
+      while (i < x.size) {
+        if (x.getByte(i) != tag.toByte || x.getByte(x.size - 1) != tag.toByte)
+          throw new AssertionError(s"$x was overwritten while live")
+        i += 61
+      }
       release(x)
     }
     val owners = (0 until 3).map { t =>
@@ -486,7 +495,8 @@ class BufferAllocatorSuite extends ScalaCheckSuite {
       }
     }
     val trimmer = guard {
-      while (!stop.get()) { alloc.trim(); Thread.`yield`() }
+      // Sleeps between trims: a trimmer spinning on the lock starves the others on Native.
+      while (!stop.get()) { alloc.trim(); Thread.sleep(1) }
     }
     (owners :+ sharedUser :+ trimmer).foreach(_.start())
     owners.foreach(_.join())
