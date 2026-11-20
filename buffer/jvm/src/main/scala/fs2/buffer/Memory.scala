@@ -37,6 +37,9 @@ private[buffer] object Memory {
   /** Whether [[Checks.Paranoid]] can give each buffer memory that faults after release. */
   final val GuardedBuffers = true
 
+  /** Keeps `ref` strongly reachable up to this call. */
+  def reachabilityFence(ref: AnyRef): Unit = java.lang.ref.Reference.reachabilityFence(ref)
+
   def allocateSlab(size: Long): SlabMemory = {
     val arena = Arena.ofShared()
     val segment =
@@ -58,14 +61,31 @@ private[buffer] object Memory {
           arena.close()
           throw t
       }
-    new NativeBuf(segment.asSlice(0L, size.toLong), size, null, -1, null, arena, flags)
+    new NativeBuf(segment.asSlice(0L, size.toLong), size, null, -1, 0, null, arena, flags)
   }
 
   private final class JvmSlab(arena: Arena, segment: MemorySegment) extends SlabMemory {
     val size: Long = segment.byteSize()
     def address: Long = segment.address()
-    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int, flags: Int): NativeBuf =
-      new NativeBuf(segment.asSlice(offset, size.toLong), capacity, page, slot, null, null, flags)
+    def buf(
+        offset: Long,
+        size: Int,
+        capacity: Int,
+        page: Page,
+        slot: Int,
+        gen: Int,
+        flags: Int
+    ): NativeBuf =
+      new NativeBuf(
+        segment.asSlice(offset, size.toLong),
+        capacity,
+        page,
+        slot,
+        gen,
+        null,
+        null,
+        flags
+      )
     def free(): Unit = arena.close()
   }
 }

@@ -42,19 +42,35 @@ object BufferAllocatorMBeans {
   def unregister(name: ObjectName): Unit =
     ManagementFactory.getPlatformMBeanServer.unregisterMBean(name)
 
+  /** Every getter reads one snapshot, refreshed at most once a second, so a JMX client
+    * reading all attributes takes the allocator lock once, not once per attribute. Reading
+    * never polls for leaks, so `onLeak` never runs on a JMX thread.
+    */
   private final class Impl(a: BufferAllocator) extends BufferAllocatorMXBean {
-    def getSlabs: Int = a.stats.slabs
-    def getSlabBytes: Long = a.stats.slabBytes
-    def getPagesInUse: Int = a.stats.pagesInUse
-    def getPagesInUseByClass: Array[Int] = a.stats.pagesInUseByClass.toArray
+    private[this] var cached: BufferAllocator.Stats = null
+    private[this] var cachedAt = 0L
+
+    private[this] def s: BufferAllocator.Stats = synchronized {
+      val now = System.nanoTime()
+      if ((cached eq null) || now - cachedAt > 1000000000L) {
+        cached = a.snapshot()
+        cachedAt = now
+      }
+      cached
+    }
+
+    def getSlabs: Int = s.slabs
+    def getSlabBytes: Long = s.slabBytes
+    def getPagesInUse: Int = s.pagesInUse
+    def getPagesInUseByClass: Array[Int] = s.pagesInUseByClass.toArray
     def getSizeClasses: Array[Int] = SizeClass.sizes.toArray
-    def getSharedUsedSlots: Int = a.stats.sharedUsedSlots
-    def getUnpooledBuffers: Long = a.stats.unpooledBuffers
-    def getUnpooledBytes: Long = a.stats.unpooledBytes
-    def getMagazines: Int = a.stats.magazines
-    def getTrimmedBytes: Long = a.stats.trimmedBytes
-    def getLeaksDetected: Long = a.stats.leaksDetected
-    def getFollowedLeases: Int = a.stats.followedLeases
+    def getSharedUsedSlots: Int = s.sharedUsedSlots
+    def getUnpooledBuffers: Long = s.unpooledBuffers
+    def getUnpooledBytes: Long = s.unpooledBytes
+    def getMagazines: Int = s.magazines
+    def getTrimmedBytes: Long = s.trimmedBytes
+    def getLeaksDetected: Long = s.leaksDetected
+    def getFollowedLeases: Int = s.followedLeases
     def getChecks: String = a.config.checks.name
     def getLeakDetection: String = a.config.leakDetection.toString
   }

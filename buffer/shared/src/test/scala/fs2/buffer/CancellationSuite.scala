@@ -45,14 +45,17 @@ class CancellationSuite extends munit.CatsEffectSuite {
 
   override def munitIOTimeout: Duration = 10.minutes
 
-  private def newAllocator() =
+  private def newAllocator(
+      checks: Checks = Checks.Full,
+      leakDetection: LeakDetection = LeakDetection.Off
+  ) =
     BufferAllocator(
       BufferAllocator.Config(
         slabSize = 2 * 1024 * 1024,
         idleTimeout = 1.hour,
-        checks = Checks.Full,
+        checks = checks,
         poison = true,
-        leakDetection = LeakDetection.Off
+        leakDetection = leakDetection
       )
     )
 
@@ -94,16 +97,22 @@ class CancellationSuite extends munit.CatsEffectSuite {
       case Fail            => IO.raiseError(Boom)
     }
 
-  /** Runs `p` and returns any non-`Boom` failure, so an AssertionError inside the
-    * program fails the test even when cancellation hides it.
+  /** `p`, failing with any non-`Boom` error, so an AssertionError inside the program
+    * fails the test even when cancellation hides it.
     */
-  private def runOnce(p: Prog, cancelAfter: Option[(Int, Int)]): IO[Unit] = {
-    val alloc = newAllocator()
-    val tags = new AtomicInteger
-    val prog = interpret(p, alloc, tags).attempt.flatMap {
+  private def checked(p: Prog, alloc: BufferAllocator, tags: AtomicInteger): IO[Unit] =
+    interpret(p, alloc, tags).attempt.flatMap {
       case Left(Boom) | Right(_) => IO.unit
       case Left(e)               => IO.raiseError(e)
     }
+
+  /** Runs `p` under `TestControl`, checks the allocator drained, and returns how many
+    * leases the run actually acquired.
+    */
+  private def runOnce(p: Prog, cancelAfter: Option[(Int, Int)]): IO[Int] = {
+    val alloc = newAllocator()
+    val tags = new AtomicInteger
+    val prog = checked(p, alloc, tags)
     val test = cancelAfter match {
       case None              => prog
       case Some((ms, cedes)) =>
@@ -118,6 +127,7 @@ class CancellationSuite extends munit.CatsEffectSuite {
       val s = alloc.stats
       assertEquals(s.slabs, 0, s"$p cancelled at $cancelAfter: $s")
       assertEquals(s.unpooledBuffers, 0L, s"$p cancelled at $cancelAfter: $s")
+      tags.get()
     }
   }
 
@@ -130,33 +140,65 @@ class CancellationSuite extends munit.CatsEffectSuite {
     val seeds = 0 until 600
     val runs = new AtomicInteger
     val leases = new AtomicInteger
+    val interrupted = new AtomicInteger
     seeds.toList.traverse_ { seed =>
       val p = gen(new Random(seed.toLong), 5)
       for {
-        _ <- runOnce(p, None)
+        full <- runOnce(p, None)
         total <- duration(p)
         _ <- (0 to total).toList.traverse_ { ms =>
           (0 to 5).toList.traverse_(cedes =>
-            runOnce(p, Some((ms, cedes))) *> IO(runs.incrementAndGet())
+            runOnce(p, Some((ms, cedes))).flatMap { n =>
+              IO {
+                runs.incrementAndGet()
+                leases.addAndGet(n)
+                // Cancelled with some, not all, of its leases taken: the case that matters.
+                if (n > 0 && n < full) interrupted.incrementAndGet()
+              }
+            }
           )
         }
-        _ <- IO(leases.addAndGet(countLeases(p)))
       } yield ()
     } *> IO {
-      // Guard against the fuzzer quietly testing nothing.
-      println(s"cancellation fuzz: ${runs.get()} cancelled runs over ${leases.get()} leases")
+      // Guard against the fuzzer quietly testing nothing: count leases actually acquired
+      // in cancelled runs, not leases that merely appear in the programs.
+      println(
+        s"cancellation fuzz: ${runs.get()} cancelled runs acquired ${leases.get()} leases; " +
+          s"${interrupted.get()} were cancelled part way"
+      )
       assert(runs.get() > 5000, s"only ${runs.get()} cancelled runs")
-      assert(leases.get() > 500, s"only ${leases.get()} leases in the programs")
+      assert(leases.get() > 5000, s"only ${leases.get()} leases acquired in cancelled runs")
+      assert(interrupted.get() > 500, s"only ${interrupted.get()} runs cancelled part way")
     }
   }
 
-  private def countLeases(p: Prog): Int = p match {
-    case Lease(_, b)     => 1 + countLeases(b)
-    case Then(a, b)      => countLeases(a) + countLeases(b)
-    case Both(a, b)      => countLeases(a) + countLeases(b)
-    case Race(a, b)      => countLeases(a) + countLeases(b)
-    case Uncancelable(a) => countLeases(a)
-    case _               => 0
+  test("on the real runtime, cancelled lease programs leak nothing (paranoid checks)") {
+    // TestControl cannot show real thread interleavings or the leak detector at work, so
+    // run the same programs on the real work-stealing pool, cancelled after random real
+    // delays, with every lease followed by the leak detector.
+    val alloc = newAllocator(Checks.Paranoid, LeakDetection.Paranoid)
+    val tags = new AtomicInteger
+    val rnd = new Random(42)
+    (0 until 400).toList.traverse_ { seed =>
+      val p = gen(new Random(seed.toLong), 5)
+      val delay = rnd.nextInt(2000)
+      checked(p, alloc, tags).start.flatMap { f =>
+        IO.sleep(delay.micros) *> f.cancel *> f.join.flatMap(
+          _.fold(IO.unit, IO.raiseError, identity)
+        )
+      }
+    } *> IO {
+      System.gc()
+      Thread.sleep(50)
+      System.gc()
+      alloc.trim(force = true)
+      val s = alloc.stats
+      assert(tags.get() > 200, s"only ${tags.get()} leases acquired")
+      assertEquals(s.leaksDetected, 0L, s.toString)
+      assertEquals(s.followedLeases, 0, s.toString)
+      assertEquals(s.slabs, 0, s.toString)
+      assertEquals(s.unpooledBuffers, 0L, s.toString)
+    }
   }
 
   test("a lease is released on error and on cancellation of an uncancelable-acquired use") {

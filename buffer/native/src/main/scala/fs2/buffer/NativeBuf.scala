@@ -53,21 +53,29 @@ final class NativeBuf private[buffer] (
     val capacity: Int,
     private[buffer] val page: Page,
     private[buffer] val slot: Int,
+    private[buffer] val gen: Int,
     private[buffer] val root: NativeBuf,
     private[this] val unpooled: Boolean,
     private[buffer] val flags: Int
 ) {
   import NativeBuf._
 
-  private[this] var released = false
+  /** The lease state for unpooled buffers; pooled ones use their page's generations. */
+  private[this] val unpooledLease: java.util.concurrent.atomic.AtomicBoolean =
+    if ((page eq null) && (root eq null)) new java.util.concurrent.atomic.AtomicBoolean else null
   private[buffer] var tracker: LeakDetector.Tracker = null
 
   def address: Long = ptr.toLong
 
   def isSlice: Boolean = root ne null
 
-  /** Whether the lease has been released. A slice reports its root's state. */
-  def isReleased: Boolean = if (root eq null) released else root.isReleased
+  /** Whether the lease has been released. Exact from any thread. A slice reports its
+    * root's state.
+    */
+  def isReleased: Boolean =
+    if (root ne null) root.isReleased
+    else if (page ne null) !page.isLive(slot, gen)
+    else unpooledLease.get()
 
   @inline private[this] def check(index: Int, width: Int): Unit = {
     if ((flags & CheckFull) != 0) checkLive()
@@ -85,39 +93,33 @@ final class NativeBuf private[buffer] (
     if (offset < 0 || length < 0 || offset > bound - length)
       throw new IndexOutOfBoundsException(s"offset $offset, length $length, size $bound")
 
-  @inline private[this] def load16(index: Int): Short = {
-    val tmp = stackalloc[Short]()
-    memcpy(tmp, ptr + index, 2.toCSize)
-    !tmp
+  // Unaligned access, assembled from bytes. A stackalloc'd temporary plus memcpy would let
+  // LLVM emit one unaligned load, but an inlined stackalloc inside a caller's loop can grow
+  // the stack on every iteration. The values below are in native byte order.
+  @inline private[this] def b(index: Int): Long = (ptr(index) & 0xff).toLong
+
+  @inline private[this] def le16(index: Int): Int = (b(index) | (b(index + 1) << 8)).toInt
+  @inline private[this] def le32(index: Int): Int =
+    (b(index) | (b(index + 1) << 8) | (b(index + 2) << 16) | (b(index + 3) << 24)).toInt
+  @inline private[this] def le64(index: Int): Long =
+    (le32(index).toLong & 0xffffffffL) | (le32(index + 4).toLong << 32)
+
+  @inline private[this] def load16(index: Int): Short = toLE16(le16(index).toShort)
+  @inline private[this] def load32(index: Int): Int = toLE32(le32(index))
+  @inline private[this] def load64(index: Int): Long = toLE64(le64(index))
+
+  @inline private[this] def storeLE(index: Int, v: Long, width: Int): Unit = {
+    var i = 0
+    while (i < width) {
+      ptr(index + i) = (v >>> (8 * i)).toByte
+      i += 1
+    }
   }
-  @inline private[this] def load32(index: Int): Int = {
-    val tmp = stackalloc[Int]()
-    memcpy(tmp, ptr + index, 4.toCSize)
-    !tmp
-  }
-  @inline private[this] def load64(index: Int): Long = {
-    val tmp = stackalloc[Long]()
-    memcpy(tmp, ptr + index, 8.toCSize)
-    !tmp
-  }
-  @inline private[this] def store16(index: Int, v: Short): Unit = {
-    val tmp = stackalloc[Short]()
-    !tmp = v
-    memcpy(ptr + index, tmp, 2.toCSize)
-    ()
-  }
-  @inline private[this] def store32(index: Int, v: Int): Unit = {
-    val tmp = stackalloc[Int]()
-    !tmp = v
-    memcpy(ptr + index, tmp, 4.toCSize)
-    ()
-  }
-  @inline private[this] def store64(index: Int, v: Long): Unit = {
-    val tmp = stackalloc[Long]()
-    !tmp = v
-    memcpy(ptr + index, tmp, 8.toCSize)
-    ()
-  }
+  @inline private[this] def store16(index: Int, v: Short): Unit =
+    storeLE(index, toLE16(v).toLong, 2)
+  @inline private[this] def store32(index: Int, v: Int): Unit =
+    storeLE(index, toLE32(v).toLong, 4)
+  @inline private[this] def store64(index: Int, v: Long): Unit = storeLE(index, toLE64(v), 8)
 
   def getByte(index: Int): Byte = { check(index, 1); ptr(index) }
   def putByte(index: Int, value: Byte): Unit = { check(index, 1); ptr(index) = value }
@@ -202,6 +204,7 @@ final class NativeBuf private[buffer] (
       length,
       null,
       -1,
+      0,
       if (root eq null) this else root,
       false,
       flags
@@ -214,9 +217,13 @@ final class NativeBuf private[buffer] (
   private[buffer] def markReleased(): Unit = {
     if (root ne null)
       throw new IllegalStateException("a slice cannot be released; release its root")
-    if (released) throw new IllegalStateException(s"$this already released")
-    released = true
+    val ended =
+      if (page ne null) page.endLease(slot, gen) else unpooledLease.compareAndSet(false, true)
+    if (!ended) throw new IllegalStateException(s"$this already released")
   }
+
+  /** Reopens an unpooled lease whose memory could not be freed. */
+  private[buffer] def unmarkReleased(): Unit = unpooledLease.set(false)
 
   /** Fills the buffer with [[NativeBuf.PoisonByte]] if the allocator poisons released memory. */
   private[buffer] def poison(): Unit =

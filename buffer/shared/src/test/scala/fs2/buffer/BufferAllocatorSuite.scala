@@ -154,7 +154,7 @@ class BufferAllocatorSuite extends ScalaCheckSuite {
     val rnd = new scala.util.Random(42)
     (0 until 200).foreach { _ =>
       val i = rnd.nextInt(56)
-      rnd.nextInt(6) match {
+      rnd.nextInt(7) match {
         case 0 =>
           val v = rnd.nextLong(); b.putLong(i, v);
           ref.order(java.nio.ByteOrder.BIG_ENDIAN).putLong(i, v)
@@ -170,6 +170,9 @@ class BufferAllocatorSuite extends ScalaCheckSuite {
         case 4 =>
           val v = rnd.nextInt().toShort; b.putShort(i, v);
           ref.order(java.nio.ByteOrder.BIG_ENDIAN).putShort(i, v)
+        case 5 =>
+          val v = rnd.nextInt().toShort; b.putShortLE(i, v);
+          ref.order(java.nio.ByteOrder.LITTLE_ENDIAN).putShort(i, v)
         case _ =>
           val v = rnd.nextInt().toByte; b.putByte(i, v); ref.put(i, v)
       }
@@ -308,6 +311,18 @@ class BufferAllocatorSuite extends ScalaCheckSuite {
     assertEquals(alloc.stats.slabs, 0)
   }
 
+  test("trim returns a slab once it has been idle for the timeout") {
+    val alloc = BufferAllocator(smallConfig.copy(idleTimeout = 200.millis))
+    val m = alloc.newMagazine()
+    val bufs = (0 until 4).map(_ => m.allocate(SizeClass.Large))
+    bufs.foreach(m.release)
+    m.close()
+    assertEquals(alloc.trim(), 0L)
+    Thread.sleep(400)
+    assertEquals(alloc.trim(), 2L * 1024 * 1024)
+    assertEquals(alloc.stats.slabs, 0)
+  }
+
   test("with a zero idle timeout, retiring pages trims empty slabs on its own") {
     val alloc = BufferAllocator(smallConfig.copy(idleTimeout = Duration.Zero))
     val m = alloc.newMagazine()
@@ -377,6 +392,110 @@ class BufferAllocatorSuite extends ScalaCheckSuite {
     bufs.foreach(alloc.release)
     alloc.trim()
     assertEquals(alloc.stats.sharedUsedSlots, 0)
+    assertDrained(alloc)
+  }
+
+  test("racing releases of one buffer: exactly one wins, the slot is freed once") {
+    val alloc = BufferAllocator(smallConfig)
+    val m = alloc.newMagazine()
+    (0 until 2000).foreach { _ =>
+      val b = m.allocate(100)
+      val start = new CountDownLatch(1)
+      val wins = new java.util.concurrent.atomic.AtomicInteger
+      val threads = (0 until 2).map { _ =>
+        new Thread(() => {
+          start.await()
+          try { alloc.release(b); wins.incrementAndGet(); () }
+          catch { case _: IllegalStateException => () }
+        })
+      }
+      threads.foreach(_.start())
+      start.countDown()
+      threads.foreach(_.join())
+      assertEquals(wins.get(), 1)
+      assert(b.isReleased)
+    }
+    m.collect()
+    assertEquals(m.usedSlots, 0)
+    m.close()
+    assertDrained(alloc)
+  }
+
+  test("a stale buffer can never release a later lease of the same slot") {
+    val alloc = BufferAllocator(smallConfig)
+    val m = alloc.newMagazine()
+    val a = m.allocate(100)
+    m.release(a)
+    val b = m.allocate(100)
+    assertEquals(b.address, a.address)
+    assert(a.isReleased)
+    assert(!b.isReleased)
+    intercept[IllegalStateException](m.release(a))
+    intercept[IllegalStateException](alloc.release(a))
+    assert(!b.isReleased)
+    m.release(b)
+    m.close()
+    assertDrained(alloc)
+  }
+
+  test("owners, the shared pool, closes and trims all running at once") {
+    val alloc = BufferAllocator(smallConfig)
+    val queue = new ConcurrentLinkedQueue[(NativeBuf, Int)]
+    val stop = new java.util.concurrent.atomic.AtomicBoolean(false)
+    val failure = new AtomicReference[Throwable]
+    def guard(body: => Unit): Thread = new Thread(() =>
+      try body
+      catch { case e: Throwable => failure.compareAndSet(null, e); () }
+    )
+    def checkAndRelease(e: (NativeBuf, Int), release: NativeBuf => Unit): Unit = {
+      val (x, tag) = e
+      val bytes = x.toArray
+      if (!bytes.forall(_ == tag.toByte)) throw new AssertionError(s"$x was overwritten while live")
+      release(x)
+    }
+    val owners = (0 until 3).map { t =>
+      guard {
+        val rnd = new scala.util.Random(t.toLong)
+        var round = 0
+        while (round < 20) {
+          val m = alloc.newMagazine()
+          var i = 0
+          while (i < 500) {
+            val b = m.allocate(rnd.nextInt(SizeClass.Bulk) + 1)
+            val tag = rnd.nextInt(255) + 1
+            b.fill(tag.toByte)
+            queue.add(b -> tag)
+            val e = queue.poll()
+            if (e ne null) checkAndRelease(e, m.release)
+            i += 1
+          }
+          m.close() // pages with buffers still queued move to the shared pool
+          round += 1
+        }
+      }
+    }
+    val sharedUser = guard {
+      val rnd = new scala.util.Random(99)
+      while (!stop.get()) {
+        val b = alloc.allocate(rnd.nextInt(SizeClass.Record) + 1)
+        val tag = rnd.nextInt(255) + 1
+        b.fill(tag.toByte)
+        queue.add(b -> tag)
+        val e = queue.poll()
+        if (e ne null) checkAndRelease(e, alloc.release)
+      }
+    }
+    val trimmer = guard {
+      while (!stop.get()) { alloc.trim(); Thread.`yield`() }
+    }
+    (owners :+ sharedUser :+ trimmer).foreach(_.start())
+    owners.foreach(_.join())
+    stop.set(true)
+    sharedUser.join()
+    trimmer.join()
+    if (failure.get() ne null) throw failure.get()
+    var e = queue.poll()
+    while (e ne null) { checkAndRelease(e, alloc.release); e = queue.poll() }
     assertDrained(alloc)
   }
 

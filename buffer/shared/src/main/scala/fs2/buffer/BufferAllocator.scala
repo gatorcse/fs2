@@ -44,7 +44,10 @@ import scala.concurrent.duration._
   *     magazine that owns its page.
   *   - Empty pages return to their slab, and slabs that stay entirely free for
   *     [[BufferAllocator.Config.idleTimeout]] go back to the OS, so memory shrinks after a
-  *     spike. Trimming runs opportunistically as pages are retired, and on [[trim]].
+  *     spike. Trimming runs opportunistically when a page is retired, but a slab that went
+  *     idle with no later retirement, and pages left in the shared pool by closed
+  *     magazines, are only returned by [[trim]]. Call it periodically, for example from a
+  *     poller tick; nothing in the allocator runs on a timer.
   *
   * Buffers above [[SizeClass.MaxPooled]] are allocated directly and freed on release.
   *
@@ -66,13 +69,13 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
 
   private[this] val lock = new Object
   private[this] val slabs = new ArrayBuffer[Slab]
-  private[this] val shared = new Magazine(this)
+  private[this] val shared = new Magazine(this, trackLeaks = false)
   private[this] var lastTrim = System.nanoTime()
   private[this] val idleNanos = config.idleTimeout.toNanos
 
   private[this] val unpooledCount = new AtomicLong
   private[this] val unpooledBytes = new AtomicLong
-  private[this] val unpooledAllocs = new AtomicLong
+  private[this] val directAllocs = new AtomicLong
   private[this] val magazines = new AtomicInteger
   private[this] var trimmedBytes = 0L
 
@@ -94,11 +97,16 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
     */
   def allocate(size: Int): NativeBuf = {
     if (size < 0) throw new IllegalArgumentException(s"negative size $size")
-    if (size > SizeClass.MaxPooled) {
-      val buf = allocateUnpooled(size)
-      if (leakMask >= 0 && (unpooledAllocs.getAndIncrement() & leakMask) == 0) track(buf)
-      buf
-    } else lock.synchronized(shared.allocate(size))
+    val buf =
+      if (size > SizeClass.MaxPooled) allocateUnpooled(size)
+      else lock.synchronized(shared.allocate(size))
+    // Followed here, outside the lock: capturing the stack trace and calling onLeak must not
+    // stall every other shared allocation.
+    if (leakMask >= 0 && (directAllocs.getAndIncrement() & leakMask) == 0) {
+      track(buf)
+      checkLeaks(): Unit
+    }
+    buf
   }
 
   /** A buffer leased for the lifetime of the resource. It is acquired uncancelably and
@@ -110,11 +118,8 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
   /** Allocates a buffer, applies `f`, and releases the buffer however `f` exits. `f` must
     * not keep the buffer.
     */
-  def withBuffer[A](size: Int)(f: NativeBuf => A): A = {
-    val buf = allocate(size)
-    try f(buf)
-    finally release(buf)
-  }
+  def withBuffer[A](size: Int)(f: NativeBuf => A): A =
+    BufferAllocator.using(allocate(size), f, release)
 
   /** Reports leases collected without release since the last check, through
     * [[BufferAllocator.Config.onLeak]]. Also runs on every followed allocation and on
@@ -124,10 +129,12 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
 
   /** Releases a buffer from any thread, without taking a lock. */
   def release(buf: NativeBuf): Unit = {
-    beforeFree(buf)
     val p = buf.page
-    if (p eq null) freeUnpooled(buf)
-    else p.freeRemote(buf.slot)
+    if (p eq null) releaseUnpooled(buf)
+    else {
+      beforeFree(buf)
+      p.freeRemote(buf.slot)
+    }
   }
 
   /** Collects the shared pool, including its empty current pages, and returns idle slabs to the OS. With `force`, every
@@ -140,7 +147,12 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
   }
 
   def stats: BufferAllocator.Stats = {
-    checkLeaks()
+    checkLeaks(): Unit
+    snapshot()
+  }
+
+  /** As [[stats]], without polling for leaks, so it never runs `onLeak`. */
+  private[buffer] def snapshot(): BufferAllocator.Stats =
     lock.synchronized {
       val byClass = new Array[Int](SizeClass.Count)
       slabs.foreach(_.pages.foreach(p => if (p.isFormatted) byClass(p.sizeClass) += 1))
@@ -158,7 +170,6 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
         followedLeases = leaks.tracked
       )
     }
-  }
 
   // ---- internal, called by magazines ----
 
@@ -166,15 +177,41 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
 
   private[buffer] def magazineClosed(): Unit = { magazines.decrementAndGet(); () }
 
-  /** Every release path runs this before the slot is freed. */
+  /** Every pooled release path runs this before the slot is freed. Throws, changing
+    * nothing, if the lease was already released.
+    */
   private[buffer] def beforeFree(buf: NativeBuf): Unit = {
     buf.markReleased()
+    untrack(buf)
+    buf.poison()
+  }
+
+  /** Releases an unpooled buffer. If freeing throws (for example a JVM arena still held by
+    * an in-flight operation) the lease is reopened and nothing is counted, so the release
+    * can be retried.
+    */
+  private[buffer] def releaseUnpooled(buf: NativeBuf): Unit = {
+    buf.markReleased()
+    try buf.freeUnpooled()
+    catch {
+      case t: Throwable =>
+        buf.unmarkReleased()
+        throw t
+    }
+    unpooledCount.decrementAndGet()
+    unpooledBytes.addAndGet(-buf.capacity.toLong)
+    untrack(buf)
+  }
+
+  private[this] def untrack(buf: NativeBuf): Unit = {
     val t = buf.tracker
     if (t ne null) {
       buf.tracker = null
       leaks.untrack(t)
     }
-    buf.poison()
+    // Keep buf reachable until its tracker is gone, or the GC could enqueue the tracker
+    // first and a concurrent poll would report a released buffer as leaked.
+    Memory.reachabilityFence(buf)
   }
 
   private[buffer] def allocateUnpooled(size: Int): NativeBuf = {
@@ -182,12 +219,6 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
     unpooledCount.incrementAndGet()
     unpooledBytes.addAndGet(size.toLong)
     buf
-  }
-
-  private[buffer] def freeUnpooled(buf: NativeBuf): Unit = {
-    unpooledCount.decrementAndGet()
-    unpooledBytes.addAndGet(-buf.capacity.toLong)
-    buf.freeUnpooled()
   }
 
   private[buffer] def acquirePage(cls: Int, owner: Magazine): Page = lock.synchronized {
@@ -308,6 +339,20 @@ object BufferAllocator {
   )
 
   def apply(config: Config = Config()): BufferAllocator = new BufferAllocator(config)
+
+  /** `try`/`finally` that keeps `f`'s exception when the release also throws. */
+  private[buffer] def using[A](buf: NativeBuf, f: NativeBuf => A, release: NativeBuf => Unit): A = {
+    val a =
+      try f(buf)
+      catch {
+        case t: Throwable =>
+          try release(buf)
+          catch { case r: Throwable => t.addSuppressed(r) }
+          throw t
+      }
+    release(buf)
+    a
+  }
 
   /** The process-wide default allocator. */
   lazy val global: BufferAllocator = apply()

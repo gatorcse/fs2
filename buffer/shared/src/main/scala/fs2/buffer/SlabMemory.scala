@@ -33,8 +33,16 @@ private[buffer] trait SlabMemory {
   /** Base address, for diagnostics and tests. */
   def address: Long
 
-  /** A buffer over `[offset, offset + size)` of this block, backed by slot `slot` of `page`. */
-  def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int, flags: Int): NativeBuf
+  /** A buffer over `[offset, offset + size)` of this block: lease `gen` of slot `slot` of `page`. */
+  def buf(
+      offset: Long,
+      size: Int,
+      capacity: Int,
+      page: Page,
+      slot: Int,
+      gen: Int,
+      flags: Int
+  ): NativeBuf
 
   /** Returns the whole block to the OS. No buffer of it may be used afterwards. */
   def free(): Unit

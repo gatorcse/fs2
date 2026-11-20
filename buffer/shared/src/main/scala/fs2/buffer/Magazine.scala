@@ -39,7 +39,10 @@ import scala.collection.mutable.ArrayBuffer
   * Call [[collect]] periodically (from the owner) to return empty pages, and [[close]]
   * when the owner goes away so its pages pass to the allocator's shared pool.
   */
-final class Magazine private[buffer] (val allocator: BufferAllocator) {
+final class Magazine private[buffer] (
+    val allocator: BufferAllocator,
+    trackLeaks: Boolean = true
+) {
 
   private[this] val current = new Array[Page](SizeClass.Count)
   private[this] val owned = Array.fill(SizeClass.Count)(new ArrayBuffer[Page])
@@ -62,10 +65,25 @@ final class Magazine private[buffer] (val allocator: BufferAllocator) {
           p = refill(cls)
           slot = p.allocateSlot()
         }
-        p.slab.memory.buf(p.slotOffset(slot), size, p.slotSize, p, slot, allocator.bufFlags)
+        p.slab.memory.buf(
+          p.slotOffset(slot),
+          size,
+          p.slotSize,
+          p,
+          slot,
+          p.beginLease(slot),
+          allocator.bufFlags
+        )
       }
-    val mask = allocator.leakMask
-    if (mask >= 0 && (allocCount & mask) == 0) allocator.track(buf)
+    // The shared pool runs under the allocator lock, so the allocator follows its leases
+    // itself, outside the lock.
+    if (trackLeaks) {
+      val mask = allocator.leakMask
+      if (mask >= 0 && (allocCount & mask) == 0) {
+        allocator.track(buf)
+        allocator.checkLeaks(): Unit
+      }
+    }
     allocCount += 1
     buf
   }
@@ -73,21 +91,17 @@ final class Magazine private[buffer] (val allocator: BufferAllocator) {
   /** Allocates a buffer, applies `f`, and releases the buffer however `f` exits. For
     * synchronous code on the owning thread; `f` must not keep the buffer.
     */
-  def withBuffer[A](size: Int)(f: NativeBuf => A): A = {
-    val buf = allocate(size)
-    try f(buf)
-    finally release(buf)
-  }
+  def withBuffer[A](size: Int)(f: NativeBuf => A): A =
+    BufferAllocator.using(allocate(size), f, release)
 
   /** Number of allocations made through this magazine. */
   def allocations: Long = allocCount
 
   /** Releases a buffer allocated by any magazine of the same allocator. */
   def release(buf: NativeBuf): Unit = {
-    allocator.beforeFree(buf)
     val p = buf.page
-    if (p eq null) allocator.freeUnpooled(buf)
-    else if (p.owner eq this) {
+    if (p eq null) allocator.releaseUnpooled(buf)
+    else if ({ allocator.beforeFree(buf); p.owner eq this }) {
       p.freeLocal(buf.slot)
       if (p.used == 0 && (p ne current(p.sizeClass))) retire(p)
     } else p.freeRemote(buf.slot)

@@ -38,6 +38,9 @@ private[buffer] object Memory {
   /** Native has no cheap per-buffer guard, so [[Checks.Paranoid]] means [[Checks.Full]]. */
   final val GuardedBuffers = false
 
+  /** Keeps `ref` strongly reachable up to this call. */
+  def reachabilityFence(ref: AnyRef): Unit = if (ref eq null) () else ()
+
   def allocateSlab(size: Long): SlabMemory = {
     val p = mman.mmap(
       null,
@@ -57,18 +60,27 @@ private[buffer] object Memory {
   def allocateUnpooled(size: Int, flags: Int): NativeBuf = {
     val p = stdlib.malloc(math.max(size, 1).toCSize)
     if (p == null) throw new OutOfMemoryError(s"malloc of $size bytes failed")
-    new NativeBuf(p, size, size, null, -1, null, true, flags)
+    new NativeBuf(p, size, size, null, -1, 0, null, true, flags)
   }
 
   def freeUnpooled(p: Ptr[Byte]): Unit = stdlib.free(p)
 
   private final class NativeSlab(base: Ptr[Byte], val size: Long) extends SlabMemory {
     def address: Long = base.toLong
-    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int, flags: Int): NativeBuf =
-      new NativeBuf(base + offset, size, capacity, page, slot, null, false, flags)
-    def free(): Unit = {
-      mman.munmap(base, this.size.toCSize)
-      ()
-    }
+    def buf(
+        offset: Long,
+        size: Int,
+        capacity: Int,
+        page: Page,
+        slot: Int,
+        gen: Int,
+        flags: Int
+    ): NativeBuf =
+      new NativeBuf(base + offset, size, capacity, page, slot, gen, null, false, flags)
+    def free(): Unit =
+      if (mman.munmap(base, this.size.toCSize) != 0)
+        throw new IllegalStateException(
+          s"munmap of $size bytes failed: ${fromCString(string.strerror(errno.errno))}"
+        )
   }
 }

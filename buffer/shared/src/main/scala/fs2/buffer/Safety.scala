@@ -25,6 +25,11 @@ package fs2.buffer
   *
   * A pooled slot stays mapped after release, so without a check a stale read returns
   * whatever the slot's next owner wrote instead of failing.
+  *
+  * Checks are best effort. A check and the access after it are not atomic, so a release
+  * on another thread between the two goes unnoticed. Raw views (the JVM `segment` and
+  * `asByteBuffer`, the Native pointer) skip the checks entirely once taken. Poisoning
+  * covers a buffer's `size` bytes, not the rest of its slot.
   */
 sealed abstract class Checks(private[buffer] val flags: Int, val name: String)
     extends Product
@@ -64,6 +69,11 @@ object Checks {
 /** How many leases the leak detector follows. A followed lease records where it was
   * allocated; if it becomes unreachable without being released, the allocator reports it
   * through [[BufferAllocator.Config.onLeak]].
+  *
+  * Detection relies on weak references, so a leak is only seen after the GC collects the
+  * lost buffer, and on Scala Native only with a GC that clears weak references (Immix or
+  * Commix, not the no-op GC). Reports come from a later allocation or [[BufferAllocator.stats]]
+  * call, never from inside the allocator lock.
   */
 sealed abstract class LeakDetection extends Product with Serializable {
 

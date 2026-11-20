@@ -39,8 +39,8 @@ private[buffer] final class LeakDetector(onLeak: LeakReport => Unit) {
   private[this] val live = ConcurrentHashMap.newKeySet[LeakDetector.Tracker]()
   private[this] val leaks = new AtomicLong
 
+  /** Follows `buf`. Never calls `onLeak`; callers poll separately, outside any lock. */
   def track(buf: NativeBuf): Unit = {
-    poll()
     val t = new LeakDetector.Tracker(
       buf,
       queue,
