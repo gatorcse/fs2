@@ -166,7 +166,7 @@ class SafetySuite extends munit.FunSuite {
     while (reports.size < n && System.nanoTime() < deadline) {
       System.gc()
       Thread.sleep(20)
-      alloc.checkLeaks()
+      alloc.checkLeaks(): Unit
     }
   }
 
