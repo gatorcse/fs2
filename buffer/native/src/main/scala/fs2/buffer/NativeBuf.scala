@@ -36,9 +36,13 @@ import scala.scalanative.unsigned._
   *
   * Every accessor checks its bounds, as `MemorySegment` does on the JVM.
   *
-  * A buffer must be released exactly once, through its allocator or a magazine, and not
-  * used afterwards. Slices share the memory and the lease of their root and cannot be
-  * released themselves.
+  * A buffer is a lease: it must be released exactly once, through its allocator or a
+  * magazine, and not used afterwards. Prefer [[BufferAllocator.lease]] or
+  * [[BufferAllocator.withBuffer]], which release on every exit path. Slices share the
+  * memory and the lease of their root and cannot be released themselves.
+  *
+  * Depending on the allocator's [[Checks]], operations on a released buffer throw
+  * `IllegalStateException`; see [[Checks]] for which ones.
   */
 final class NativeBuf private[buffer] (
     /** Address of the first byte. */
@@ -50,11 +54,13 @@ final class NativeBuf private[buffer] (
     private[buffer] val page: Page,
     private[buffer] val slot: Int,
     private[buffer] val root: NativeBuf,
-    private[this] val unpooled: Boolean
+    private[this] val unpooled: Boolean,
+    private[buffer] val flags: Int
 ) {
   import NativeBuf._
 
   private[this] var released = false
+  private[buffer] var tracker: LeakDetector.Tracker = null
 
   def address: Long = ptr.toLong
 
@@ -63,9 +69,17 @@ final class NativeBuf private[buffer] (
   /** Whether the lease has been released. A slice reports its root's state. */
   def isReleased: Boolean = if (root eq null) released else root.isReleased
 
-  @inline private[this] def check(index: Int, width: Int): Unit =
+  @inline private[this] def check(index: Int, width: Int): Unit = {
+    if ((flags & CheckFull) != 0) checkLive()
     if (index < 0 || index > size - width)
       throw new IndexOutOfBoundsException(s"index $index, width $width, size $size")
+  }
+
+  @inline private def bulk(): Unit =
+    if ((flags & CheckBulk) != 0) checkLive()
+
+  private[this] def checkLive(): Unit =
+    if (isReleased) throw new IllegalStateException(s"$this used after release")
 
   @inline private[this] def checkRange(offset: Int, length: Int, bound: Int): Unit =
     if (offset < 0 || length < 0 || offset > bound - length)
@@ -129,6 +143,7 @@ final class NativeBuf private[buffer] (
 
   /** Copies `length` bytes starting at `srcOffset` into `dst` at `dstOffset`. */
   def copyToArray(srcOffset: Int, dst: Array[Byte], dstOffset: Int, length: Int): Unit = {
+    bulk()
     checkRange(srcOffset, length, size)
     checkRange(dstOffset, length, dst.length)
     if (length > 0) { memcpy(dst.atUnsafe(dstOffset), ptr + srcOffset, length.toCSize); () }
@@ -136,6 +151,7 @@ final class NativeBuf private[buffer] (
 
   /** Copies `length` bytes of `src` from `srcOffset` into this buffer at `dstOffset`. */
   def copyFromArray(src: Array[Byte], srcOffset: Int, dstOffset: Int, length: Int): Unit = {
+    bulk()
     checkRange(srcOffset, length, src.length)
     checkRange(dstOffset, length, size)
     if (length > 0) { memcpy(ptr + dstOffset, src.atUnsafe(srcOffset), length.toCSize); () }
@@ -145,13 +161,17 @@ final class NativeBuf private[buffer] (
     * ranges may overlap.
     */
   def copyTo(srcOffset: Int, dst: NativeBuf, dstOffset: Int, length: Int): Unit = {
+    bulk()
+    dst.bulk()
     checkRange(srcOffset, length, size)
     checkRange(dstOffset, length, dst.size)
     if (length > 0) { memmove(dst.ptr + dstOffset, ptr + srcOffset, length.toCSize); () }
   }
 
-  def fill(value: Byte): Unit =
+  def fill(value: Byte): Unit = {
+    bulk()
     if (size > 0) { memset(ptr, value.toInt, size.toCSize); () }
+  }
 
   /** A heap copy of the whole buffer. */
   def toArray: Array[Byte] = {
@@ -162,6 +182,7 @@ final class NativeBuf private[buffer] (
 
   /** Index of the first `value` in `[from, until)`, or -1. */
   def indexOf(value: Byte, from: Int, until: Int): Int = {
+    bulk()
     if (from < 0 || until > size || from > until)
       throw new IndexOutOfBoundsException(s"[$from, $until) of $size")
     if (from == until) -1
@@ -173,8 +194,18 @@ final class NativeBuf private[buffer] (
 
   /** A view of `[offset, offset + length)` sharing this buffer's memory and lease. */
   def slice(offset: Int, length: Int): NativeBuf = {
+    bulk()
     checkRange(offset, length, size)
-    new NativeBuf(ptr + offset, length, length, null, -1, if (root eq null) this else root, false)
+    new NativeBuf(
+      ptr + offset,
+      length,
+      length,
+      null,
+      -1,
+      if (root eq null) this else root,
+      false,
+      flags
+    )
   }
 
   override def toString: String =
@@ -183,22 +214,43 @@ final class NativeBuf private[buffer] (
   private[buffer] def markReleased(): Unit = {
     if (root ne null)
       throw new IllegalStateException("a slice cannot be released; release its root")
-    if (released) throw new IllegalStateException("buffer already released")
+    if (released) throw new IllegalStateException(s"$this already released")
     released = true
   }
+
+  /** Fills the buffer with [[NativeBuf.PoisonByte]] if the allocator poisons released memory. */
+  private[buffer] def poison(): Unit =
+    if ((flags & Poison) != 0 && !unpooled && size > 0) {
+      memset(ptr, PoisonByte.toInt, size.toCSize); ()
+    }
 
   private[buffer] def freeUnpooled(): Unit =
     if (unpooled) Memory.freeUnpooled(ptr)
 }
 
-private object NativeBuf {
+object NativeBuf {
+
+  /** The byte released buffers are filled with when poisoning is on. */
+  final val PoisonByte: Byte = 0xde.toByte
+
+  private[buffer] final val CheckBulk = 1
+  private[buffer] final val CheckFull = 2
+  private[buffer] final val Guarded = 4
+  private[buffer] final val Poison = 8
+
   private[this] val littleEndian: Boolean =
     java.nio.ByteOrder.nativeOrder() == java.nio.ByteOrder.LITTLE_ENDIAN
 
-  @inline def toBE16(v: Short): Short = if (littleEndian) java.lang.Short.reverseBytes(v) else v
-  @inline def toLE16(v: Short): Short = if (littleEndian) v else java.lang.Short.reverseBytes(v)
-  @inline def toBE32(v: Int): Int = if (littleEndian) java.lang.Integer.reverseBytes(v) else v
-  @inline def toLE32(v: Int): Int = if (littleEndian) v else java.lang.Integer.reverseBytes(v)
-  @inline def toBE64(v: Long): Long = if (littleEndian) java.lang.Long.reverseBytes(v) else v
-  @inline def toLE64(v: Long): Long = if (littleEndian) v else java.lang.Long.reverseBytes(v)
+  @inline private[buffer] def toBE16(v: Short): Short =
+    if (littleEndian) java.lang.Short.reverseBytes(v) else v
+  @inline private[buffer] def toLE16(v: Short): Short =
+    if (littleEndian) v else java.lang.Short.reverseBytes(v)
+  @inline private[buffer] def toBE32(v: Int): Int =
+    if (littleEndian) java.lang.Integer.reverseBytes(v) else v
+  @inline private[buffer] def toLE32(v: Int): Int =
+    if (littleEndian) v else java.lang.Integer.reverseBytes(v)
+  @inline private[buffer] def toBE64(v: Long): Long =
+    if (littleEndian) java.lang.Long.reverseBytes(v) else v
+  @inline private[buffer] def toLE64(v: Long): Long =
+    if (littleEndian) v else java.lang.Long.reverseBytes(v)
 }

@@ -607,6 +607,10 @@ lazy val buffer = crossProject(JVMPlatform, NativePlatform)
     tlVersionIntroduced := List("2.12", "2.13", "3").map(_ -> "3.16.0").toMap,
     mimaPreviousArtifacts := Set.empty,
     libraryDependencies ++= Seq(
+      "org.typelevel" %%% "cats-effect-kernel" % "3.7.1",
+      "org.typelevel" %%% "cats-effect" % "3.7.1" % Test,
+      "org.typelevel" %%% "cats-effect-testkit" % "3.7.1" % Test,
+      "org.typelevel" %%% "munit-cats-effect" % "2.2.1" % Test,
       "org.scalameta" %%% "munit-scalacheck" % "1.2.0" % Test
     )
   )

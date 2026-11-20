@@ -44,6 +44,7 @@ final class Magazine private[buffer] (val allocator: BufferAllocator) {
   private[this] val current = new Array[Page](SizeClass.Count)
   private[this] val owned = Array.fill(SizeClass.Count)(new ArrayBuffer[Page])
   private[this] var closed = false
+  private[this] var allocCount = 0L
 
   /** Allocates a buffer of exactly `size` bytes. Its capacity is the slot size of the
     * smallest fitting class, or `size` for unpooled buffers above [[SizeClass.MaxPooled]].
@@ -52,21 +53,38 @@ final class Magazine private[buffer] (val allocator: BufferAllocator) {
     if (size < 0) throw new IllegalArgumentException(s"negative size $size")
     if (closed) throw new IllegalStateException("magazine is closed")
     val cls = SizeClass.indexFor(size)
-    if (cls < 0) allocator.allocateUnpooled(size)
-    else {
-      var p = current(cls)
-      var slot = if (p ne null) p.allocateSlot() else -1
-      if (slot < 0) {
-        p = refill(cls)
-        slot = p.allocateSlot()
+    val buf =
+      if (cls < 0 || allocator.guarded) allocator.allocateUnpooled(size)
+      else {
+        var p = current(cls)
+        var slot = if (p ne null) p.allocateSlot() else -1
+        if (slot < 0) {
+          p = refill(cls)
+          slot = p.allocateSlot()
+        }
+        p.slab.memory.buf(p.slotOffset(slot), size, p.slotSize, p, slot, allocator.bufFlags)
       }
-      p.slab.memory.buf(p.slotOffset(slot), size, p.slotSize, p, slot)
-    }
+    val mask = allocator.leakMask
+    if (mask >= 0 && (allocCount & mask) == 0) allocator.track(buf)
+    allocCount += 1
+    buf
   }
+
+  /** Allocates a buffer, applies `f`, and releases the buffer however `f` exits. For
+    * synchronous code on the owning thread; `f` must not keep the buffer.
+    */
+  def withBuffer[A](size: Int)(f: NativeBuf => A): A = {
+    val buf = allocate(size)
+    try f(buf)
+    finally release(buf)
+  }
+
+  /** Number of allocations made through this magazine. */
+  def allocations: Long = allocCount
 
   /** Releases a buffer allocated by any magazine of the same allocator. */
   def release(buf: NativeBuf): Unit = {
-    buf.markReleased()
+    allocator.beforeFree(buf)
     val p = buf.page
     if (p eq null) allocator.freeUnpooled(buf)
     else if (p.owner eq this) {
@@ -110,6 +128,7 @@ final class Magazine private[buffer] (val allocator: BufferAllocator) {
   def close(): Unit =
     if (!closed) {
       closed = true
+      allocator.magazineClosed()
       var cls = 0
       while (cls < SizeClass.Count) {
         current(cls) = null

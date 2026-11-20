@@ -34,6 +34,9 @@ private[buffer] object Memory {
 
   final val Alignment = 4096L
 
+  /** Whether [[Checks.Paranoid]] can give each buffer memory that faults after release. */
+  final val GuardedBuffers = true
+
   def allocateSlab(size: Long): SlabMemory = {
     val arena = Arena.ofShared()
     val segment =
@@ -46,7 +49,7 @@ private[buffer] object Memory {
     new JvmSlab(arena, segment)
   }
 
-  def allocateUnpooled(size: Int): NativeBuf = {
+  def allocateUnpooled(size: Int, flags: Int): NativeBuf = {
     val arena = Arena.ofShared()
     val segment =
       try arena.allocate(math.max(size, 1).toLong, 64L)
@@ -55,14 +58,14 @@ private[buffer] object Memory {
           arena.close()
           throw t
       }
-    new NativeBuf(segment.asSlice(0L, size.toLong), size, null, -1, null, arena)
+    new NativeBuf(segment.asSlice(0L, size.toLong), size, null, -1, null, arena, flags)
   }
 
   private final class JvmSlab(arena: Arena, segment: MemorySegment) extends SlabMemory {
     val size: Long = segment.byteSize()
     def address: Long = segment.address()
-    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int): NativeBuf =
-      new NativeBuf(segment.asSlice(offset, size.toLong), capacity, page, slot, null, null)
+    def buf(offset: Long, size: Int, capacity: Int, page: Page, slot: Int, flags: Int): NativeBuf =
+      new NativeBuf(segment.asSlice(offset, size.toLong), capacity, page, slot, null, null, flags)
     def free(): Unit = arena.close()
   }
 }

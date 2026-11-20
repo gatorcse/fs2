@@ -48,3 +48,30 @@ class NativeBufJvmSuite extends munit.FunSuite {
     intercept[IllegalStateException](seg.get(java.lang.foreign.ValueLayout.JAVA_BYTE, 0L))
   }
 }
+
+class ParanoidJvmSuite extends munit.FunSuite {
+
+  test("Checks.Paranoid closes each buffer's arena, so even ByteBuffer views fail after release") {
+    val alloc = BufferAllocator(BufferAllocator.Config(checks = Checks.Paranoid))
+    val b = alloc.allocate(64)
+    val bb = b.asByteBuffer
+    bb.putInt(0, 1)
+    alloc.release(b)
+    intercept[IllegalStateException](bb.getInt(0))
+    intercept[IllegalStateException](b.segment.get(java.lang.foreign.ValueLayout.JAVA_BYTE, 0L))
+    assertEquals(alloc.stats.unpooledBuffers, 0L)
+  }
+
+  test("the allocator's stats are visible over JMX") {
+    val alloc = BufferAllocator()
+    val name = BufferAllocatorMBeans.register(alloc, "test")
+    try {
+      val b = alloc.allocate(100)
+      val server = java.lang.management.ManagementFactory.getPlatformMBeanServer
+      assertEquals(server.getAttribute(name, "Slabs"), 1: Any)
+      assertEquals(server.getAttribute(name, "PagesInUse"), 1: Any)
+      assertEquals(server.getAttribute(name, "Checks"), alloc.config.checks.name: Any)
+      alloc.release(b)
+    } finally BufferAllocatorMBeans.unregister(name)
+  }
+}

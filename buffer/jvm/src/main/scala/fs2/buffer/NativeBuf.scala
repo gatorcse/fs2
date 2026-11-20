@@ -33,9 +33,13 @@ import java.nio.ByteBuffer
   * and the `LE` ones little-endian, which is what 8-bytes-at-a-time scanning wants on
   * x86-64 and AArch64.
   *
-  * A buffer must be released exactly once, through its allocator or a magazine, and not
-  * used afterwards. Slices share the memory and the lease of their root and cannot be
-  * released themselves.
+  * A buffer is a lease: it must be released exactly once, through its allocator or a
+  * magazine, and not used afterwards. Prefer [[BufferAllocator.lease]] or
+  * [[BufferAllocator.withBuffer]], which release on every exit path. Slices share the
+  * memory and the lease of their root and cannot be released themselves.
+  *
+  * Depending on the allocator's [[Checks]], operations on a released buffer throw
+  * `IllegalStateException`; see [[Checks]] for which ones.
   */
 final class NativeBuf private[buffer] (
     /** The memory behind this buffer, exactly [[size]] bytes long. */
@@ -45,10 +49,13 @@ final class NativeBuf private[buffer] (
     private[buffer] val page: Page,
     private[buffer] val slot: Int,
     private[buffer] val root: NativeBuf,
-    private[this] val arena: Arena
+    private[this] val arena: Arena,
+    private[buffer] val flags: Int
 ) {
+  import NativeBuf._
 
   private[this] var released = false
+  private[buffer] var tracker: LeakDetector.Tracker = null
 
   /** Length in bytes. */
   val size: Int = segment.byteSize().toInt
@@ -61,44 +68,69 @@ final class NativeBuf private[buffer] (
   /** Whether the lease has been released. A slice reports its root's state. */
   def isReleased: Boolean = if (root eq null) released else root.isReleased
 
-  def getByte(index: Int): Byte = SegmentAccess.getByte(segment, index.toLong)
-  def putByte(index: Int, value: Byte): Unit = SegmentAccess.putByte(segment, index.toLong, value)
+  @inline private[this] def full(): Unit =
+    if ((flags & CheckFull) != 0) checkLive()
 
-  def getShort(index: Int): Short = SegmentAccess.getShortBE(segment, index.toLong)
-  def getShortLE(index: Int): Short = SegmentAccess.getShortLE(segment, index.toLong)
-  def putShort(index: Int, value: Short): Unit =
-    SegmentAccess.putShortBE(segment, index.toLong, value)
-  def putShortLE(index: Int, value: Short): Unit =
-    SegmentAccess.putShortLE(segment, index.toLong, value)
+  @inline private def bulk(): Unit =
+    if ((flags & CheckBulk) != 0) checkLive()
 
-  def getInt(index: Int): Int = SegmentAccess.getIntBE(segment, index.toLong)
-  def getIntLE(index: Int): Int = SegmentAccess.getIntLE(segment, index.toLong)
-  def putInt(index: Int, value: Int): Unit = SegmentAccess.putIntBE(segment, index.toLong, value)
-  def putIntLE(index: Int, value: Int): Unit =
-    SegmentAccess.putIntLE(segment, index.toLong, value)
+  private[this] def checkLive(): Unit =
+    if (isReleased) throw new IllegalStateException(s"$this used after release")
 
-  def getLong(index: Int): Long = SegmentAccess.getLongBE(segment, index.toLong)
-  def getLongLE(index: Int): Long = SegmentAccess.getLongLE(segment, index.toLong)
-  def putLong(index: Int, value: Long): Unit =
-    SegmentAccess.putLongBE(segment, index.toLong, value)
-  def putLongLE(index: Int, value: Long): Unit =
-    SegmentAccess.putLongLE(segment, index.toLong, value)
+  def getByte(index: Int): Byte = { full(); SegmentAccess.getByte(segment, index.toLong) }
+  def putByte(index: Int, value: Byte): Unit = {
+    full(); SegmentAccess.putByte(segment, index.toLong, value)
+  }
+
+  def getShort(index: Int): Short = { full(); SegmentAccess.getShortBE(segment, index.toLong) }
+  def getShortLE(index: Int): Short = { full(); SegmentAccess.getShortLE(segment, index.toLong) }
+  def putShort(index: Int, value: Short): Unit = {
+    full(); SegmentAccess.putShortBE(segment, index.toLong, value)
+  }
+  def putShortLE(index: Int, value: Short): Unit = {
+    full(); SegmentAccess.putShortLE(segment, index.toLong, value)
+  }
+
+  def getInt(index: Int): Int = { full(); SegmentAccess.getIntBE(segment, index.toLong) }
+  def getIntLE(index: Int): Int = { full(); SegmentAccess.getIntLE(segment, index.toLong) }
+  def putInt(index: Int, value: Int): Unit = {
+    full(); SegmentAccess.putIntBE(segment, index.toLong, value)
+  }
+  def putIntLE(index: Int, value: Int): Unit = {
+    full(); SegmentAccess.putIntLE(segment, index.toLong, value)
+  }
+
+  def getLong(index: Int): Long = { full(); SegmentAccess.getLongBE(segment, index.toLong) }
+  def getLongLE(index: Int): Long = { full(); SegmentAccess.getLongLE(segment, index.toLong) }
+  def putLong(index: Int, value: Long): Unit = {
+    full(); SegmentAccess.putLongBE(segment, index.toLong, value)
+  }
+  def putLongLE(index: Int, value: Long): Unit = {
+    full(); SegmentAccess.putLongLE(segment, index.toLong, value)
+  }
 
   /** Copies `length` bytes starting at `srcOffset` into `dst` at `dstOffset`. */
-  def copyToArray(srcOffset: Int, dst: Array[Byte], dstOffset: Int, length: Int): Unit =
+  def copyToArray(srcOffset: Int, dst: Array[Byte], dstOffset: Int, length: Int): Unit = {
+    bulk()
     SegmentAccess.copyToArray(segment, srcOffset.toLong, dst, dstOffset, length)
+  }
 
   /** Copies `length` bytes of `src` from `srcOffset` into this buffer at `dstOffset`. */
-  def copyFromArray(src: Array[Byte], srcOffset: Int, dstOffset: Int, length: Int): Unit =
+  def copyFromArray(src: Array[Byte], srcOffset: Int, dstOffset: Int, length: Int): Unit = {
+    bulk()
     SegmentAccess.copyFromArray(src, srcOffset, segment, dstOffset.toLong, length)
+  }
 
   /** Copies `length` bytes from this buffer at `srcOffset` to `dst` at `dstOffset`. The
     * ranges may overlap.
     */
-  def copyTo(srcOffset: Int, dst: NativeBuf, dstOffset: Int, length: Int): Unit =
+  def copyTo(srcOffset: Int, dst: NativeBuf, dstOffset: Int, length: Int): Unit = {
+    bulk()
+    dst.bulk()
     MemorySegment.copy(segment, srcOffset.toLong, dst.segment, dstOffset.toLong, length.toLong)
+  }
 
-  def fill(value: Byte): Unit = { segment.fill(value); () }
+  def fill(value: Byte): Unit = { bulk(); segment.fill(value); () }
 
   /** A heap copy of the whole buffer. */
   def toArray: Array[Byte] = {
@@ -109,6 +141,7 @@ final class NativeBuf private[buffer] (
 
   /** Index of the first `value` in `[from, until)`, or -1. */
   def indexOf(value: Byte, from: Int, until: Int): Int = {
+    bulk()
     if (from < 0 || until > size || from > until)
       throw new IndexOutOfBoundsException(s"[$from, $until) of $size")
     var i = from
@@ -120,18 +153,25 @@ final class NativeBuf private[buffer] (
   }
 
   /** A view of `[offset, offset + length)` sharing this buffer's memory and lease. */
-  def slice(offset: Int, length: Int): NativeBuf =
+  def slice(offset: Int, length: Int): NativeBuf = {
+    bulk()
     new NativeBuf(
       segment.asSlice(offset.toLong, length.toLong),
       length,
       null,
       -1,
       if (root eq null) this else root,
-      null
+      null,
+      flags
     )
+  }
 
-  /** A `ByteBuffer` view for JDK APIs such as `FileChannel` and `SSLEngine`. No copy. */
-  def asByteBuffer: ByteBuffer = segment.asByteBuffer()
+  /** A `ByteBuffer` view for JDK APIs such as `FileChannel` and `SSLEngine`. No copy.
+    *
+    * The view does not check the lease: it must not outlive it. Under [[Checks.Paranoid]]
+    * it fails once the lease is released, because the buffer's own arena is closed.
+    */
+  def asByteBuffer: ByteBuffer = { bulk(); segment.asByteBuffer() }
 
   override def toString: String =
     s"NativeBuf(size = $size, capacity = $capacity, address = 0x${java.lang.Long.toHexString(address)})"
@@ -139,9 +179,24 @@ final class NativeBuf private[buffer] (
   private[buffer] def markReleased(): Unit = {
     if (root ne null)
       throw new IllegalStateException("a slice cannot be released; release its root")
-    if (released) throw new IllegalStateException("buffer already released")
+    if (released) throw new IllegalStateException(s"$this already released")
     released = true
   }
 
+  /** Fills the buffer with [[PoisonByte]] if the allocator poisons released memory. */
+  private[buffer] def poison(): Unit =
+    if ((flags & Poison) != 0 && (arena eq null)) { segment.fill(PoisonByte); () }
+
   private[buffer] def freeUnpooled(): Unit = arena.close()
+}
+
+object NativeBuf {
+
+  /** The byte released buffers are filled with when poisoning is on. */
+  final val PoisonByte: Byte = 0xde.toByte
+
+  private[buffer] final val CheckBulk = 1
+  private[buffer] final val CheckFull = 2
+  private[buffer] final val Guarded = 4
+  private[buffer] final val Poison = 8
 }
