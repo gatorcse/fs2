@@ -153,7 +153,7 @@ class CancellationSuite extends munit.CatsEffectSuite {
                 runs.incrementAndGet()
                 leases.addAndGet(n)
                 // Cancelled with some, not all, of its leases taken: the case that matters.
-                if (n > 0 && n < full) interrupted.incrementAndGet()
+                if (n > 0 && n < full) interrupted.incrementAndGet(): Unit
               }
             }
           )
