@@ -21,8 +21,8 @@
 
 package fs2.buffer
 
-import java.lang.foreign.{Arena, MemorySegment}
-import java.nio.ByteBuffer
+import java.lang.foreign.{Arena, MemorySegment, ValueLayout}
+import java.nio.{ByteBuffer, ByteOrder}
 
 /** A fixed-size region of native memory from a [[BufferAllocator]].
   *
@@ -69,36 +69,36 @@ final class NativeBuf private[buffer] (
     else if (page ne null) !page.isLive(slot, gen)
     else unpooledLease.get()
 
-  def getByte(index: Int): Byte = SegmentAccess.getByte(segment, index.toLong)
-  def putByte(index: Int, value: Byte): Unit = SegmentAccess.putByte(segment, index.toLong, value)
+  def getByte(index: Int): Byte = segment.get(NativeBuf.JByte, index.toLong)
+  def putByte(index: Int, value: Byte): Unit = segment.set(NativeBuf.JByte, index.toLong, value)
 
-  def getShort(index: Int): Short = SegmentAccess.getShortBE(segment, index.toLong)
-  def getShortLE(index: Int): Short = SegmentAccess.getShortLE(segment, index.toLong)
+  def getShort(index: Int): Short = segment.get(NativeBuf.ShortBE, index.toLong)
+  def getShortLE(index: Int): Short = segment.get(NativeBuf.ShortLE, index.toLong)
   def putShort(index: Int, value: Short): Unit =
-    SegmentAccess.putShortBE(segment, index.toLong, value)
+    segment.set(NativeBuf.ShortBE, index.toLong, value)
   def putShortLE(index: Int, value: Short): Unit =
-    SegmentAccess.putShortLE(segment, index.toLong, value)
+    segment.set(NativeBuf.ShortLE, index.toLong, value)
 
-  def getInt(index: Int): Int = SegmentAccess.getIntBE(segment, index.toLong)
-  def getIntLE(index: Int): Int = SegmentAccess.getIntLE(segment, index.toLong)
-  def putInt(index: Int, value: Int): Unit = SegmentAccess.putIntBE(segment, index.toLong, value)
+  def getInt(index: Int): Int = segment.get(NativeBuf.IntBE, index.toLong)
+  def getIntLE(index: Int): Int = segment.get(NativeBuf.IntLE, index.toLong)
+  def putInt(index: Int, value: Int): Unit = segment.set(NativeBuf.IntBE, index.toLong, value)
   def putIntLE(index: Int, value: Int): Unit =
-    SegmentAccess.putIntLE(segment, index.toLong, value)
+    segment.set(NativeBuf.IntLE, index.toLong, value)
 
-  def getLong(index: Int): Long = SegmentAccess.getLongBE(segment, index.toLong)
-  def getLongLE(index: Int): Long = SegmentAccess.getLongLE(segment, index.toLong)
+  def getLong(index: Int): Long = segment.get(NativeBuf.LongBE, index.toLong)
+  def getLongLE(index: Int): Long = segment.get(NativeBuf.LongLE, index.toLong)
   def putLong(index: Int, value: Long): Unit =
-    SegmentAccess.putLongBE(segment, index.toLong, value)
+    segment.set(NativeBuf.LongBE, index.toLong, value)
   def putLongLE(index: Int, value: Long): Unit =
-    SegmentAccess.putLongLE(segment, index.toLong, value)
+    segment.set(NativeBuf.LongLE, index.toLong, value)
 
   /** Copies `length` bytes starting at `srcOffset` into `dst` at `dstOffset`. */
   def copyToArray(srcOffset: Int, dst: Array[Byte], dstOffset: Int, length: Int): Unit =
-    SegmentAccess.copyToArray(segment, srcOffset.toLong, dst, dstOffset, length)
+    MemorySegment.copy(segment, NativeBuf.JByte, srcOffset.toLong, dst, dstOffset, length)
 
   /** Copies `length` bytes of `src` from `srcOffset` into this buffer at `dstOffset`. */
   def copyFromArray(src: Array[Byte], srcOffset: Int, dstOffset: Int, length: Int): Unit =
-    SegmentAccess.copyFromArray(src, srcOffset, segment, dstOffset.toLong, length)
+    MemorySegment.copy(src, srcOffset, segment, NativeBuf.JByte, dstOffset.toLong, length)
 
   /** Copies `length` bytes from this buffer at `srcOffset` to `dst` at `dstOffset`. The
     * ranges may overlap.
@@ -121,7 +121,7 @@ final class NativeBuf private[buffer] (
       throw new IndexOutOfBoundsException(s"[$from, $until) of $size")
     var i = from
     while (i < until) {
-      if (SegmentAccess.getByte(segment, i.toLong) == value) return i
+      if (segment.get(NativeBuf.JByte, i.toLong) == value) return i
       i += 1
     }
     -1
@@ -154,4 +154,19 @@ final class NativeBuf private[buffer] (
   }
 
   private[buffer] def freeUnpooled(): Unit = arena.close()
+}
+
+private[buffer] object NativeBuf {
+  // The accessors' layouts. Measured with AccessorBenchmark: held here they compile to the
+  // same plain loads and stores as Java static finals would.
+  val JByte: ValueLayout.OfByte = ValueLayout.JAVA_BYTE
+  val ShortBE: ValueLayout.OfShort =
+    ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN)
+  val ShortLE: ValueLayout.OfShort =
+    ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN)
+  val IntBE: ValueLayout.OfInt = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN)
+  val IntLE: ValueLayout.OfInt = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN)
+  val LongBE: ValueLayout.OfLong = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN)
+  val LongLE: ValueLayout.OfLong =
+    ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN)
 }

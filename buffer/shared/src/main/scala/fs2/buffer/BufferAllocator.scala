@@ -78,9 +78,9 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
     else p.freeRemote(buf.slot)
   }
 
-  /** Collects the shared pool, including its empty current pages, and returns idle slabs to the OS. With `force`, every
-    * entirely free slab is returned regardless of how long it has been idle. Returns the
-    * number of bytes given back.
+  /** Collects the shared pool, including its empty current pages, and returns idle slabs
+    * to the OS. With `force`, every entirely free slab is returned regardless of how long
+    * it has been idle. Returns the number of bytes given back.
     */
   def trim(force: Boolean = false): Long = lock.synchronized {
     shared.collect(retainCurrent = false)
