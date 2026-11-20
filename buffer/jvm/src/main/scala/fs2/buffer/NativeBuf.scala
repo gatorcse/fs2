@@ -76,10 +76,10 @@ final class NativeBuf private[buffer] (
     else if (page ne null) !page.isLive(slot, gen)
     else unpooledLease.get()
 
-  @inline private[this] def full(): Unit =
+  private[this] def full(): Unit =
     if ((flags & CheckFull) != 0) checkLive()
 
-  @inline private def bulk(): Unit =
+  private def bulk(): Unit =
     if ((flags & CheckBulk) != 0) checkLive()
 
   private[this] def checkLive(): Unit =
