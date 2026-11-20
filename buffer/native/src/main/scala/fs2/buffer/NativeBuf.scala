@@ -58,6 +58,7 @@ final class NativeBuf private[buffer] (
     private[this] val unpooled: Boolean,
     private[buffer] val flags: Int
 ) {
+
   import NativeBuf._
 
   /** The lease state for unpooled buffers; pooled ones use their page's generations. */
@@ -93,20 +94,16 @@ final class NativeBuf private[buffer] (
     if (offset < 0 || length < 0 || offset > bound - length)
       throw new IndexOutOfBoundsException(s"offset $offset, length $length, size $bound")
 
-  // Unaligned access, assembled from bytes. A stackalloc'd temporary plus memcpy would let
-  // LLVM emit one unaligned load, but an inlined stackalloc inside a caller's loop can grow
-  // the stack on every iteration. The values below are in native byte order.
+  // Unaligned access, assembled from bytes, so it is the same on any host byte order. A
+  // stackalloc'd temporary plus memcpy would let LLVM emit one unaligned load, but an
+  // inlined stackalloc inside a caller's loop can grow the stack on every iteration.
   @inline private[this] def b(index: Int): Long = (ptr(index) & 0xff).toLong
 
-  @inline private[this] def le16(index: Int): Int = (b(index) | (b(index + 1) << 8)).toInt
+  @inline private[this] def le16(index: Int): Short = (b(index) | (b(index + 1) << 8)).toShort
   @inline private[this] def le32(index: Int): Int =
     (b(index) | (b(index + 1) << 8) | (b(index + 2) << 16) | (b(index + 3) << 24)).toInt
   @inline private[this] def le64(index: Int): Long =
     (le32(index).toLong & 0xffffffffL) | (le32(index + 4).toLong << 32)
-
-  @inline private[this] def load16(index: Int): Short = toLE16(le16(index).toShort)
-  @inline private[this] def load32(index: Int): Int = toLE32(le32(index))
-  @inline private[this] def load64(index: Int): Long = toLE64(le64(index))
 
   @inline private[this] def storeLE(index: Int, v: Long, width: Int): Unit = {
     var i = 0
@@ -115,33 +112,32 @@ final class NativeBuf private[buffer] (
       i += 1
     }
   }
-  @inline private[this] def store16(index: Int, v: Short): Unit =
-    storeLE(index, toLE16(v).toLong, 2)
-  @inline private[this] def store32(index: Int, v: Int): Unit =
-    storeLE(index, toLE32(v).toLong, 4)
-  @inline private[this] def store64(index: Int, v: Long): Unit = storeLE(index, toLE64(v), 8)
 
   def getByte(index: Int): Byte = { check(index, 1); ptr(index) }
   def putByte(index: Int, value: Byte): Unit = { check(index, 1); ptr(index) = value }
 
-  def getShort(index: Int): Short = { check(index, 2); toBE16(load16(index)) }
-  def getShortLE(index: Int): Short = { check(index, 2); toLE16(load16(index)) }
-  def putShort(index: Int, value: Short): Unit = { check(index, 2); store16(index, toBE16(value)) }
+  def getShort(index: Int): Short = { check(index, 2); java.lang.Short.reverseBytes(le16(index)) }
+  def getShortLE(index: Int): Short = { check(index, 2); le16(index) }
+  def putShort(index: Int, value: Short): Unit = {
+    check(index, 2); storeLE(index, java.lang.Short.reverseBytes(value).toLong, 2)
+  }
   def putShortLE(index: Int, value: Short): Unit = {
-    check(index, 2); store16(index, toLE16(value))
+    check(index, 2); storeLE(index, value.toLong, 2)
   }
 
-  def getInt(index: Int): Int = { check(index, 4); toBE32(load32(index)) }
-  def getIntLE(index: Int): Int = { check(index, 4); toLE32(load32(index)) }
-  def putInt(index: Int, value: Int): Unit = { check(index, 4); store32(index, toBE32(value)) }
-  def putIntLE(index: Int, value: Int): Unit = { check(index, 4); store32(index, toLE32(value)) }
-
-  def getLong(index: Int): Long = { check(index, 8); toBE64(load64(index)) }
-  def getLongLE(index: Int): Long = { check(index, 8); toLE64(load64(index)) }
-  def putLong(index: Int, value: Long): Unit = { check(index, 8); store64(index, toBE64(value)) }
-  def putLongLE(index: Int, value: Long): Unit = {
-    check(index, 8); store64(index, toLE64(value))
+  def getInt(index: Int): Int = { check(index, 4); java.lang.Integer.reverseBytes(le32(index)) }
+  def getIntLE(index: Int): Int = { check(index, 4); le32(index) }
+  def putInt(index: Int, value: Int): Unit = {
+    check(index, 4); storeLE(index, java.lang.Integer.reverseBytes(value).toLong, 4)
   }
+  def putIntLE(index: Int, value: Int): Unit = { check(index, 4); storeLE(index, value.toLong, 4) }
+
+  def getLong(index: Int): Long = { check(index, 8); java.lang.Long.reverseBytes(le64(index)) }
+  def getLongLE(index: Int): Long = { check(index, 8); le64(index) }
+  def putLong(index: Int, value: Long): Unit = {
+    check(index, 8); storeLE(index, java.lang.Long.reverseBytes(value), 8)
+  }
+  def putLongLE(index: Int, value: Long): Unit = { check(index, 8); storeLE(index, value, 8) }
 
   /** Copies `length` bytes starting at `srcOffset` into `dst` at `dstOffset`. */
   def copyToArray(srcOffset: Int, dst: Array[Byte], dstOffset: Int, length: Int): Unit = {
@@ -244,20 +240,4 @@ object NativeBuf {
   private[buffer] final val CheckFull = 2
   private[buffer] final val Guarded = 4
   private[buffer] final val Poison = 8
-
-  private[this] val littleEndian: Boolean =
-    java.nio.ByteOrder.nativeOrder() == java.nio.ByteOrder.LITTLE_ENDIAN
-
-  @inline private[buffer] def toBE16(v: Short): Short =
-    if (littleEndian) java.lang.Short.reverseBytes(v) else v
-  @inline private[buffer] def toLE16(v: Short): Short =
-    if (littleEndian) v else java.lang.Short.reverseBytes(v)
-  @inline private[buffer] def toBE32(v: Int): Int =
-    if (littleEndian) java.lang.Integer.reverseBytes(v) else v
-  @inline private[buffer] def toLE32(v: Int): Int =
-    if (littleEndian) v else java.lang.Integer.reverseBytes(v)
-  @inline private[buffer] def toBE64(v: Long): Long =
-    if (littleEndian) java.lang.Long.reverseBytes(v) else v
-  @inline private[buffer] def toLE64(v: Long): Long =
-    if (littleEndian) v else java.lang.Long.reverseBytes(v)
 }

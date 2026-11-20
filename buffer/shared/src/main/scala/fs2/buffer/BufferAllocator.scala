@@ -137,9 +137,9 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
     }
   }
 
-  /** Collects the shared pool, including its empty current pages, and returns idle slabs to the OS. With `force`, every
-    * entirely free slab is returned regardless of how long it has been idle. Returns the
-    * number of bytes given back.
+  /** Collects the shared pool, including its empty current pages, and returns idle slabs
+    * to the OS. With `force`, every entirely free slab is returned regardless of how long
+    * it has been idle. Returns the number of bytes given back.
     */
   def trim(force: Boolean = false): Long = lock.synchronized {
     shared.collect(retainCurrent = false)
@@ -155,7 +155,7 @@ final class BufferAllocator private (val config: BufferAllocator.Config) {
   private[buffer] def snapshot(): BufferAllocator.Stats =
     lock.synchronized {
       val byClass = new Array[Int](SizeClass.Count)
-      slabs.foreach(_.pages.foreach(p => if (p.isFormatted) byClass(p.sizeClass) += 1))
+      slabs.foreach(_.pages.foreach(p => if (p.sizeClass >= 0) byClass(p.sizeClass) += 1))
       BufferAllocator.Stats(
         slabs = slabs.length,
         slabBytes = slabs.length.toLong * config.slabSize,

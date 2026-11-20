@@ -63,8 +63,6 @@ private[buffer] final class Page(val slab: Slab, val index: Int, val offset: Lon
   // Any thread.
   private[this] val remoteHead = new AtomicInteger(-1)
 
-  def isFormatted: Boolean = sizeClass >= 0
-
   /** Prepares an unformatted page to serve `cls` for `newOwner`. Called under the central lock. */
   def format(cls: Int, newOwner: Magazine): Unit = {
     val ss = SizeClass.slotSize(cls)
@@ -167,9 +165,6 @@ private[buffer] final class Page(val slab: Slab, val index: Int, val offset: Lon
 
   /** Owner only: whether a call to `allocateSlot` can succeed without reclaiming. */
   def hasLocalFree: Boolean = localHead >= 0 || fresh < capacity
-
-  /** Any thread, racy: whether remote frees are waiting. */
-  def hasRemoteFree: Boolean = remoteHead.get() >= 0
 
   def slotOffset(slot: Int): Long = offset + slot.toLong * slotSize
 }
