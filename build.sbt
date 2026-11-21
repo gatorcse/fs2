@@ -68,6 +68,9 @@ def catsEffectForkSteps(scala: String, targets: List[String], cond: Option[Strin
   )
 }
 
+// the dependency graph resolves fs2's dependencies too (the site job publishes the fork itself)
+ThisBuild / tlCiDependencyGraphJob := false
+
 // `sbt +update` would run before the cats-effect fork is published
 ThisBuild / githubWorkflowJobSetup ~= (_.filterNot(_.name.exists(_.startsWith("sbt update"))))
 
@@ -865,7 +868,8 @@ lazy val microsite = project
     },
     tlJdkRelease := None,
     tlFatalWarnings := false,
-    tlSiteApiPackage := Some("fs2")
+    tlSiteApiPackage := Some("fs2"),
+    tlSiteGenerate := catsEffectForkSteps("2.13", List("JVM"), None) ++ tlSiteGenerate.value
   )
   .dependsOn(coreJVM, io.jvm, reactiveStreams, scodec.jvm)
   .enablePlugins(TypelevelSitePlugin)

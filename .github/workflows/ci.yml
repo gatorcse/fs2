@@ -284,47 +284,6 @@ jobs:
           SONATYPE_CREDENTIAL_HOST: ${{ secrets.SONATYPE_CREDENTIAL_HOST }}
         run: sbt tlCiRelease
 
-  dependency-submission:
-    name: Submit Dependencies
-    if: github.event.repository.fork == false && github.event_name != 'pull_request'
-    strategy:
-      matrix:
-        os: [ubuntu-22.04]
-        java: [temurin@17]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout current branch (full)
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup sbt
-        uses: sbt/setup-sbt@v1
-
-      - name: Setup Java (temurin@17)
-        id: setup-java-temurin-17
-        if: matrix.java == 'temurin@17'
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 17
-          cache: sbt
-
-      - name: Setup Java (temurin@21)
-        id: setup-java-temurin-21
-        if: matrix.java == 'temurin@21'
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 21
-          cache: sbt
-
-      - name: Submit Dependencies
-        uses: scalacenter/sbt-dependency-submission@v2
-        with:
-          modules-ignore: integration_2.12 integration_2.13 integration_3 rootjs_2.12 rootjs_2.13 rootjs_3 microsite_2.12 microsite_2.13 microsite_3 rootjvm_2.12 rootjvm_2.13 rootjvm_3 rootnative_2.12 rootnative_2.13 rootnative_3 fs2-buffer-benchmark_2.12 fs2-buffer-benchmark_2.13 fs2-buffer-benchmark_3 fs2-benchmark_2.12 fs2-benchmark_2.13 fs2-benchmark_3
-          configs-ignore: test scala-tool scala-doc-tool test-internal
-
   macos:
     name: Test I/O on macOS
     strategy:
@@ -483,6 +442,12 @@ jobs:
           distribution: temurin
           java-version: 21
           cache: sbt
+
+      - name: Publish the cats-effect fork locally (JVM)
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ 2.13' kernelJVM/publishLocal kernelTestkitJVM/publishLocal lawsJVM/publishLocal coreJVM/publishLocal stdJVM/publishLocal testkitJVM/publishLocal
 
       - name: Generate site
         run: sbt microsite/tlSite
