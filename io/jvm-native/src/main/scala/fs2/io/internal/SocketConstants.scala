@@ -69,6 +69,12 @@ private[fs2] final class SocketConstants private (
     val SO_NOSIGPIPE: Int,
     // IPPROTO_TCP
     val TCP_NODELAY: Int,
+    // keep-alive tuning (`jdk.net.ExtendedSocketOptions`); `TCP_KEEPALIVE` is macOS's idle time
+    val TCP_KEEPIDLE: Int,
+    val TCP_KEEPINTVL: Int,
+    val TCP_KEEPCNT: Int,
+    // Linux only; -1 elsewhere.
+    val TCP_QUICKACK: Int,
     // IPPROTO_IP
     val IP_TOS: Int,
     val IP_MULTICAST_IF: Int,
@@ -82,6 +88,9 @@ private[fs2] final class SocketConstants private (
     val IPV6_MULTICAST_HOPS: Int,
     val IPV6_MULTICAST_LOOP: Int,
     val IPV6_V6ONLY: Int,
+    // `ipv6_mreq` joins, for IPv4 groups on a dual-stack socket on macOS
+    val IPV6_JOIN_GROUP: Int,
+    val IPV6_LEAVE_GROUP: Int,
     // protocol-independent multicast (RFC 3678), at IPPROTO_IP or IPPROTO_IPV6
     val MCAST_JOIN_GROUP: Int,
     val MCAST_LEAVE_GROUP: Int,
@@ -164,6 +173,10 @@ private[fs2] object SocketConstants {
     SO_TYPE = 3,
     SO_NOSIGPIPE = -1,
     TCP_NODELAY = 1,
+    TCP_KEEPIDLE = 4,
+    TCP_KEEPINTVL = 5,
+    TCP_KEEPCNT = 6,
+    TCP_QUICKACK = 12,
     IP_TOS = 1,
     IP_MULTICAST_IF = 32,
     IP_MULTICAST_TTL = 33,
@@ -174,6 +187,8 @@ private[fs2] object SocketConstants {
     IPV6_MULTICAST_HOPS = 18,
     IPV6_MULTICAST_LOOP = 19,
     IPV6_V6ONLY = 26,
+    IPV6_JOIN_GROUP = 20,
+    IPV6_LEAVE_GROUP = 21,
     MCAST_JOIN_GROUP = 42,
     MCAST_LEAVE_GROUP = 45,
     MCAST_JOIN_SOURCE_GROUP = 46,
@@ -240,6 +255,10 @@ private[fs2] object SocketConstants {
     SO_TYPE = 0x1008,
     SO_NOSIGPIPE = 0x1022,
     TCP_NODELAY = 1,
+    TCP_KEEPIDLE = 0x10,
+    TCP_KEEPINTVL = 0x101,
+    TCP_KEEPCNT = 0x102,
+    TCP_QUICKACK = -1,
     IP_TOS = 3,
     IP_MULTICAST_IF = 9,
     IP_MULTICAST_TTL = 10,
@@ -250,6 +269,8 @@ private[fs2] object SocketConstants {
     IPV6_MULTICAST_HOPS = 10,
     IPV6_MULTICAST_LOOP = 11,
     IPV6_V6ONLY = 27,
+    IPV6_JOIN_GROUP = 12,
+    IPV6_LEAVE_GROUP = 13,
     MCAST_JOIN_GROUP = 80,
     MCAST_LEAVE_GROUP = 81,
     MCAST_JOIN_SOURCE_GROUP = 82,

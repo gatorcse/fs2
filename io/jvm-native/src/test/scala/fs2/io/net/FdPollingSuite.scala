@@ -183,4 +183,82 @@ abstract class FdPollingSuite extends Fs2Suite {
       }
       .timeout(10.seconds)
   }
+
+  private def namedOption[A](optionName: String, tpe: Class[A]): java.net.SocketOption[A] =
+    new java.net.SocketOption[A] {
+      def name = optionName
+      def `type` = tpe
+      override def toString = optionName
+    }
+
+  test("keep-alive tuning options (jdk.net.ExtendedSocketOptions) can be set and read") {
+    val keepIdle = namedOption("TCP_KEEPIDLE", classOf[Integer])
+    tcpPair.use { case (client, _) =>
+      client.setOption(keepIdle, Integer.valueOf(42)) >>
+        client.getOption(keepIdle).assertEquals(Some(Integer.valueOf(42)))
+    }
+  }
+
+  test("an unsupported option for accepted sockets fails the accept stream, like NIO") {
+    val unknown =
+      SocketOption(namedOption("FS2_NO_SUCH_OPTION", classOf[Integer]), Integer.valueOf(1))
+    Network[IO]
+      .bind(SocketAddress(ip"127.0.0.1", Port.Wildcard), List(unknown))
+      .use { server =>
+        Network[IO].connect(server.address).surround {
+          server.accept.compile.drain.intercept[UnsupportedOperationException].void
+        }
+      }
+      .timeout(10.seconds)
+  }
+
+  private def ipv6Available: IO[Boolean] =
+    Network[IO].bind(SocketAddress(ip"::1", Port.Wildcard)).use_.attempt.map(_.isRight)
+
+  test("a wildcard server is dual-stack") {
+    ipv6Available.flatMap { available =>
+      assume(available, "IPv6 is unavailable")
+      Network[IO].bind(SocketAddress(ip"0.0.0.0", Port.Wildcard)).use { server =>
+        val port = server.address.asIpUnsafe.port
+        List(ip"127.0.0.1": IpAddress, ip"::1": IpAddress).traverse_ { host =>
+          Network[IO]
+            .connect(SocketAddress(host, port))
+            .product(server.accept.head.compile.resource.lastOrError)
+            .use { case (client, accepted) =>
+              IO(assertEquals(accepted.peerAddress, client.address))
+            }
+        }
+      }
+    }
+  }
+
+  test("a datagram socket keeps its port across connect and disconnect") {
+    val msg = Chunk.array("ping".getBytes)
+    (
+      Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard)),
+      Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard))
+    ).tupled
+      .use { case (a, b) =>
+        val aAddress = a.address.asIpUnsafe
+        a.connect(b.address) >> a.disconnect >>
+          b.write(Datagram(aAddress, msg)) >>
+          a.read.map(d => assertEquals(d.bytes, msg))
+      }
+      .timeout(10.seconds)
+  }
+
+  test("datagram writes check the connection like NIO") {
+    val msg = Chunk.array("ping".getBytes)
+    (
+      Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard)),
+      Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard)),
+      Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard))
+    ).tupled.use { case (a, b, other) =>
+      a.write(msg).intercept[IllegalStateException] >>
+        a.connect(b.address) >>
+        a.write(Datagram(other.address.asIpUnsafe, msg))
+          .intercept[IllegalStateException]
+          .void
+    }
+  }
 }

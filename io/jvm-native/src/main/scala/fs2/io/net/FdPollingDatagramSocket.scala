@@ -98,7 +98,13 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
             // a datagram is sent whole or not at all
             val sent = gate {
               val connectedTo = peer
-              val dest = if ((connectedTo ne null) && connectedTo == to) null else to
+              // like NIO; the OSes differ here (Linux sends anyway, macOS fails with EISCONN)
+              val dest =
+                if (connectedTo eq null) {
+                  if (to eq null) throw DatagramConnectionErrors.notYetConnected()
+                  to
+                } else if ((to eq null) || connectedTo == to) null
+                else throw DatagramConnectionErrors.alreadyConnected()
               fds.sendTo(fd, domain, buf, offset, length, dest)
             }
             if (sent >= 0) Either.unit else Left(())
@@ -130,6 +136,9 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
       gate {
         fds.disconnect(fd)
         peer = null
+        // Dissolving the association can unbind the socket: Linux drops a port it picked itself,
+        // and macOS a specific local address. Like the JDK, bind it again where it was.
+        if (fds.localAddress(fd) != address) fds.bind(fd, address, domain)
       }
     }
   }
@@ -165,6 +174,7 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
       gate {
         fds.multicast(
           fd,
+          domain,
           if (source.isEmpty) c.MCAST_JOIN_GROUP else c.MCAST_JOIN_SOURCE_GROUP,
           index,
           group,
@@ -176,6 +186,7 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
           gate.apply(
             fds.multicast(
               fd,
+              domain,
               if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
               index,
               group,
@@ -186,12 +197,12 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
         def block(blocked: IpAddress) = F.delay {
           if (source.isDefined)
             throw new IllegalStateException("Cannot block sources of a source-specific join")
-          gate(fds.multicast(fd, c.MCAST_BLOCK_SOURCE, index, group, Some(blocked)))
+          gate(fds.multicast(fd, domain, c.MCAST_BLOCK_SOURCE, index, group, Some(blocked)))
         }
         def unblock(blocked: IpAddress) = F.delay {
           if (source.isDefined)
             throw new IllegalStateException("Cannot unblock sources of a source-specific join")
-          gate(fds.multicast(fd, c.MCAST_UNBLOCK_SOURCE, index, group, Some(blocked)))
+          gate(fds.multicast(fd, domain, c.MCAST_UNBLOCK_SOURCE, index, group, Some(blocked)))
         }
         override def toString = "GroupMembership"
       }

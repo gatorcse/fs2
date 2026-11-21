@@ -122,6 +122,13 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
           }
         }
       }(fd => F.delay(close(fd._1)))
+    else if (host == Ipv6Address.Wildcard)
+      // like the JDK, `::` is dual-stack whatever the system default
+      openNonBlocking(c.AF_INET6, tpe)
+        .evalTap { fd =>
+          F.delay(setInt(fd, c.IPPROTO_IPV6, c.IPV6_V6ONLY, 0))
+        }
+        .map((_, c.AF_INET6))
     else {
       val domain = if (host.isInstanceOf[Ipv4Address]) c.AF_INET else c.AF_INET6
       openNonBlocking(domain, tpe).map((_, domain))
@@ -247,6 +254,17 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     val len = Array(buf.length)
     guard_(sys.getpeername(fd, buf, len))
     decode(buf, len(0))
+  }
+
+  /** The peer of an accepted connection, or `null` if the peer has already reset it. */
+  def peerAddressIfConnected(fd: Int): GenSocketAddress = {
+    val buf = new Array[Byte](c.SockaddrStorageSize)
+    val len = Array(buf.length)
+    // macOS reports EINVAL for a connection that's already gone
+    val r = guardMask(sys.getpeername(fd, buf, len)) { e =>
+      e == c.ENOTCONN || e == c.ECONNRESET || (c.isMac && e == 22)
+    }
+    if (r < 0) null else decode(buf, len(0))
   }
 
   def domainOf(address: SocketAddress[IpAddress]): Int =
@@ -475,7 +493,12 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
           }
           if (r < 0) None else Some(decode(buf, len(0)))
         }
-      case _ => None
+      case _ =>
+        extendedOption(key) match {
+          case Some((level, name, isBool)) =>
+            if (isBool) bool(level, name) else int(level, name)
+          case None => None
+        }
     }
     result.asInstanceOf[Option[A]]
   }
@@ -532,9 +555,26 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
           guard_(sys.setsockopt(fd, c.IPPROTO_IP, c.IP_MULTICAST_IF, addr.toBytes, 4))
         }
       case _ =>
-        throw new IllegalArgumentException(s"Unsupported socket option: ${key.name}")
+        extendedOption(key) match {
+          case Some((level, name, isBool)) => setInt(fd, level, name, if (isBool) bool else int)
+          case None                        =>
+            // like NIO
+            throw new UnsupportedOperationException(s"'${key.name}' not supported")
+        }
     }
   }
+
+  /** The `jdk.net.ExtendedSocketOptions` this OS has, matched by name so that Scala Native needs
+    * no `jdk.net`: their level, name and whether they're boolean.
+    */
+  private[this] def extendedOption(key: SocketOption[?]): Option[(Int, Int, Boolean)] =
+    key.name match {
+      case "TCP_KEEPIDLE"                        => Some((c.IPPROTO_TCP, c.TCP_KEEPIDLE, false))
+      case "TCP_KEEPINTERVAL"                    => Some((c.IPPROTO_TCP, c.TCP_KEEPINTVL, false))
+      case "TCP_KEEPCOUNT"                       => Some((c.IPPROTO_TCP, c.TCP_KEEPCNT, false))
+      case "TCP_QUICKACK" if c.TCP_QUICKACK >= 0 => Some((c.IPPROTO_TCP, c.TCP_QUICKACK, true))
+      case _                                     => None
+    }
 
   /** Sets an option, ignoring failure. */
   private[this] def bestEffort(fd: Int, level: Int, name: Int, value: Array[Byte]): Unit = {
@@ -558,11 +598,24 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
   /** One of the `MCAST_*` operations, with `group_req` (no `source`) or `group_source_req`. */
   def multicast(
       fd: Int,
+      domain: Int,
+      op: Int,
+      interfaceIndex: Int,
+      group: IpAddress,
+      source: Option[IpAddress]
+  ): Unit =
+    if (c.isMac && domain == c.AF_INET6 && group.isInstanceOf[Ipv4Address])
+      multicastMappedV4(fd, op, interfaceIndex, group.asInstanceOf[Ipv4Address], source)
+    else multicast0(fd, op, interfaceIndex, group, source)
+
+  private[this] def multicast0(
+      fd: Int,
       op: Int,
       interfaceIndex: Int,
       group: IpAddress,
       source: Option[IpAddress]
   ): Unit = {
+    // Linux takes IPv4 memberships on a dual-stack socket at IPPROTO_IP
     val level = if (group.isInstanceOf[Ipv4Address]) c.IPPROTO_IP else c.IPPROTO_IPV6
     val size = if (source.isDefined) c.GroupSourceReqSize else c.GroupReqSize
     val buf = new Array[Byte](size)
@@ -571,6 +624,31 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     putIp(buf, c.groupReqAddrOffset, group)
     source.foreach(putIp(buf, c.groupReqAddrOffset + c.SockaddrStorageSize, _))
     guard_(sys.setsockopt(fd, level, op, buf, size))
+  }
+
+  /** macOS only accepts IPv6-level options on an IPv6 socket, so, like the JDK, an IPv4 group on
+    * a dual-stack socket is joined as its IPv4-mapped address with an `ipv6_mreq`. That API has
+    * no source filters.
+    */
+  private[this] def multicastMappedV4(
+      fd: Int,
+      op: Int,
+      interfaceIndex: Int,
+      group: Ipv4Address,
+      source: Option[IpAddress]
+  ): Unit = {
+    val ipv6Op =
+      if (source.isEmpty && op == c.MCAST_JOIN_GROUP) c.IPV6_JOIN_GROUP
+      else if (source.isEmpty && op == c.MCAST_LEAVE_GROUP) c.IPV6_LEAVE_GROUP
+      else
+        throw new UnsupportedOperationException(
+          "Source filtering of an IPv4 group on an IPv6 socket isn't supported on macOS; bind to an IPv4 address"
+        )
+    // struct ipv6_mreq { struct in6_addr ipv6mr_multiaddr; unsigned int ipv6mr_interface; }
+    val buf = new Array[Byte](20)
+    System.arraycopy(group.toMappedV6.toBytes, 0, buf, 0, 16)
+    ByteBuffer.wrap(buf).order(ByteOrder.nativeOrder()).putInt(16, interfaceIndex)
+    guard_(sys.setsockopt(fd, c.IPPROTO_IPV6, ipv6Op, buf, buf.length))
   }
 
   private[this] def putIp(buf: Array[Byte], at: Int, ip: IpAddress): Unit =

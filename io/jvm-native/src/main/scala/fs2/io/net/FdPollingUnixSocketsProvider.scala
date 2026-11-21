@@ -88,54 +88,51 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](fds: FdSoc
       fd <- fds.openNonBlocking(c.AF_UNIX, c.SOCK_STREAM)
 
       handle <- poller.registerFileDescriptor(fd, true, false).mapK(LiftIO.liftK)
+      serverGate <- FdGate.resource[F]
       _ <- Resource.eval {
         F.delay(fds.bind(fd, address)) *> F.delay(fds.listen(fd, backlog.getOrElse(SoMaxConn)))
       }
 
       address0 = address
       info = new SocketInfo[F] {
-        def getOption[A](key: SocketOption.Key[A]) = fds.getOptionF[F, A](fd, c.AF_UNIX, key)
+        def getOption[A](key: SocketOption.Key[A]) =
+          F.delay(serverGate(fds.getOption(fd, c.AF_UNIX, key)))
         def setOption[A](key: SocketOption.Key[A], value: A) =
-          fds.setOptionF[F, A](fd, c.AF_UNIX, key, value)
+          F.delay(serverGate(fds.setOption(fd, c.AF_UNIX, key, value)))
         def supportedOptions = F.pure(fds.supportedOptions(datagram = false, c.AF_UNIX))
         val address = address0
       }
 
-      clients = Stream
-        .resource {
-          // accept errors (e.g. out of descriptors) end the stream, like NIO's; a client that
-          // fails to set up is dropped
-          Resource
-            .makeFull[F, Int] { poll =>
-              poll {
-                handle
-                  .pollReadRec(()) { _ =>
-                    IO {
-                      val clientFd = fds.accept(fd)
-                      if (clientFd >= 0) Right(clientFd) else Left(())
-                    }
+      clients = Stream.resource {
+        // errors (e.g. out of descriptors, or an unsupported option) end the stream, like NIO's
+        Resource
+          .makeFull[F, Int] { poll =>
+            poll {
+              handle
+                .pollReadRec(()) { _ =>
+                  IO {
+                    val clientFd = serverGate(fds.accept(fd))
+                    if (clientFd >= 0) Right(clientFd) else Left(())
                   }
-                  .to
-              }
-            }(fd => F.delay(fds.close(fd)))
-            .flatMap { clientFd =>
-              val socket = for {
-                _ <- Resource.eval(fds.setOptionsF(clientFd, c.AF_UNIX, filteredOptions))
-                handle <- poller.registerFileDescriptor(clientFd, true, true).mapK(LiftIO.liftK)
-                socket <- FdPollingSocket[F](
-                  fds,
-                  clientFd,
-                  c.AF_UNIX,
-                  handle,
-                  address,
-                  UnixSocketAddress("")
-                )
-              } yield socket
-              socket.attempt.map(_.toOption)
+                }
+                .to
             }
-        }
-        .repeat
-        .unNone
+          }(fd => F.delay(fds.close(fd)))
+          .flatMap { clientFd =>
+            for {
+              _ <- Resource.eval(fds.setOptionsF(clientFd, c.AF_UNIX, filteredOptions))
+              handle <- poller.registerFileDescriptor(clientFd, true, true).mapK(LiftIO.liftK)
+              socket <- FdPollingSocket[F](
+                fds,
+                clientFd,
+                c.AF_UNIX,
+                handle,
+                address,
+                UnixSocketAddress("")
+              )
+            } yield socket
+          }
+      }.repeat
 
     } yield ServerSocket(info, clients)).flatMap(server => deleteOnClose.map(_ => server))
   }
