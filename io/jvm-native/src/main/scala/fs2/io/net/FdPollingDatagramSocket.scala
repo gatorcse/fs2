@@ -32,6 +32,7 @@ import com.comcast.ip4s.{
   IpAddress,
   MulticastJoin,
   NetworkInterface,
+  Port,
   SocketAddress
 }
 import fs2.io.internal.FdSockets
@@ -137,8 +138,11 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
         fds.disconnect(fd)
         peer = null
         // Dissolving the association can unbind the socket: Linux drops a port it picked itself,
-        // and macOS a specific local address. Like the JDK, bind it again where it was.
-        if (fds.localAddress(fd) != address) fds.bind(fd, address, domain)
+        // so, like the JDK, bind it to that port again. (macOS keeps the port but resets a
+        // specific local address to the wildcard, and can't be re-bound; the JDK replaces the
+        // socket for that, which this doesn't do.)
+        if (fds.localAddress(fd).asIpUnsafe.port == Port.Wildcard)
+          fds.bind(fd, address, domain)
       }
     }
   }
