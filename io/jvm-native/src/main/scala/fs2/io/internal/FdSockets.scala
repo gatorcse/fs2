@@ -542,7 +542,9 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
         extendedOption(key) match {
           case Some((level, name, isBool)) =>
             if (isBool) bool(level, name) else int(level, name)
-          case None => None
+          case None =>
+            // like NIO
+            throw new UnsupportedOperationException(s"'${key.name}' not supported")
         }
     }
     result.asInstanceOf[Option[A]]
@@ -711,13 +713,18 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
       buf: Array[Byte],
       offset: Int,
       length: Int,
-      lengthOut: Array[Int]
+      lengthOut: Array[Int],
+      connected: Boolean
   ): GenSocketAddress = {
     val addr = new Array[Byte](c.SockaddrStorageSize)
     val addrLen = Array(addr.length)
-    val n = guardMask(sys.recvfrom(fd, buf, offset, length, 0, addr, addrLen)) { e =>
+    def recv() = guardMask(sys.recvfrom(fd, buf, offset, length, 0, addr, addrLen)) { e =>
       c.wouldBlock(e) || e == c.ECONNREFUSED
     }
+    var n = recv()
+    // a port-unreachable error left over from an earlier connection (it's consumed by the call),
+    // which, like the JDK, an unconnected socket ignores
+    while (n == -c.ECONNREFUSED && !connected) n = recv()
     if (n >= 0) {
       lengthOut(0) = n
       decode(addr, addrLen(0))

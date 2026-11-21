@@ -47,8 +47,9 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  *
  * <p>Heap arrays are passed to the kernel without a copy: every call that takes one is
  * non-blocking and bound with {@code Linker.Option.critical(true)}, which pins the array for the
- * duration of the call. Calls that can block are never critical, since a critical call holds up
- * safepoints: {@code close} (with {@code SO_LINGER}); {@code bind} and {@code connect}, which
+ * duration of the call. (Some of them, e.g. {@code read} and {@code send}, can still sleep briefly
+ * on the socket's lock while another thread uses it; that only delays a safepoint.) Calls that
+ * can block for longer are never critical, since a critical call holds up safepoints: {@code close} (with {@code SO_LINGER}); {@code bind} and {@code connect}, which
  * look up or create a file for a Unix socket; and {@code getsockopt} and {@code setsockopt}, which
  * can take sleeping kernel locks (multicast memberships take the routing lock on Linux). Those
  * copy their arguments off-heap instead.

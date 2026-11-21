@@ -64,6 +64,17 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
     */
   @volatile private[this] var peer: GenSocketAddress = null
 
+  /** Equality with IPv4-mapped IPv6 hosts as IPv4, like `java.net.InetAddress`. */
+  private[this] def sameAddress(a: GenSocketAddress, b: GenSocketAddress): Boolean =
+    (a, b) match {
+      case (x: SocketAddress[?], y: SocketAddress[?]) =>
+        x.port == y.port && ((x.host, y.host) match {
+          case (h1: IpAddress, h2: IpAddress) => h1.collapseMappedV4 == h2.collapseMappedV4
+          case (h1, h2)                       => h1 == h2
+        })
+      case _ => a == b
+    }
+
   def localAddress: F[SocketAddress[IpAddress]] = F.pure(address)
 
   def read: F[Datagram] = readMutex.lock.surround {
@@ -74,7 +85,16 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
           val buf = FdPollingSocket.scratchBuffer(MaxDatagramSize)
           val length = new Array[Int](1)
           val from =
-            gate(fds.recvFrom(fd, buf, 0, math.min(buf.length, MaxDatagramSize), length))
+            gate {
+              fds.recvFrom(
+                fd,
+                buf,
+                0,
+                math.min(buf.length, MaxDatagramSize),
+                length,
+                connected = peer ne null
+              )
+            }
           // a zero-length datagram still has a sender
           if (from eq null) Left(())
           else
@@ -104,7 +124,7 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
                 if (connectedTo eq null) {
                   if (to eq null) throw DatagramConnectionErrors.notYetConnected()
                   to
-                } else if ((to eq null) || connectedTo == to) null
+                } else if ((to eq null) || sameAddress(connectedTo, to)) null
                 else throw DatagramConnectionErrors.alreadyConnected()
               fds.sendTo(fd, domain, buf, offset, length, dest)
             }
