@@ -257,8 +257,8 @@ abstract class FdPollingSuite extends Fs2Suite {
       a.write(msg).intercept[IllegalStateException] >>
         a.connect(b.address) >>
         a.write(Datagram(other.address.asIpUnsafe, msg))
-          .intercept[IllegalStateException]
-          .void
+          .intercept[IllegalStateException] >>
+        a.connect(other.address).intercept[IllegalStateException].void
     }
   }
 }

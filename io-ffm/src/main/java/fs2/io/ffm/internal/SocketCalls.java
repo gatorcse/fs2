@@ -48,8 +48,10 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  * <p>Heap arrays are passed to the kernel without a copy: every call that takes one is
  * non-blocking and bound with {@code Linker.Option.critical(true)}, which pins the array for the
  * duration of the call. Calls that can block are never critical, since a critical call holds up
- * safepoints: {@code close} (with {@code SO_LINGER}), and {@code bind} and {@code connect}, which
- * look up or create a file for a Unix socket. Those copy their address off-heap instead.
+ * safepoints: {@code close} (with {@code SO_LINGER}); {@code bind} and {@code connect}, which
+ * look up or create a file for a Unix socket; and {@code getsockopt} and {@code setsockopt}, which
+ * can take sleeping kernel locks (multicast memberships take the routing lock on Linux). Those
+ * copy their arguments off-heap instead.
  */
 public final class SocketCalls {
 
@@ -161,13 +163,11 @@ public final class SocketCalls {
       bind(
           "getsockopt",
           FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS),
-          CRITICAL_HEAP,
           CAPTURE);
   private static final MethodHandle SETSOCKOPT =
       bind(
           "setsockopt",
           FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT),
-          CRITICAL_HEAP,
           CAPTURE);
 
   private static final MethodHandle READ =
@@ -298,9 +298,17 @@ public final class SocketCalls {
 
   public static int getsockopt(int fd, int level, int name, byte[] value, int[] valueLen) {
     MemorySegment cap = CAPTURE_TL.get();
-    try {
-      return ret(
-          cap, (int) GETSOCKOPT.invokeExact(cap, fd, level, name, heap(value), heap(valueLen)));
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment v = offHeap(arena, value);
+      MemorySegment len = arena.allocate(JAVA_INT);
+      len.set(JAVA_INT, 0, valueLen[0]);
+      int r = ret(cap, (int) GETSOCKOPT.invokeExact(cap, fd, level, name, v, len));
+      if (r >= 0) {
+        int n = Math.min(len.get(JAVA_INT, 0), value.length);
+        MemorySegment.copy(v, JAVA_BYTE, 0, value, 0, n);
+        valueLen[0] = n;
+      }
+      return r;
     } catch (Throwable t) {
       throw rethrow(t);
     }
@@ -308,9 +316,9 @@ public final class SocketCalls {
 
   public static int setsockopt(int fd, int level, int name, byte[] value, int valueLen) {
     MemorySegment cap = CAPTURE_TL.get();
-    try {
+    try (Arena arena = Arena.ofConfined()) {
       return ret(
-          cap, (int) SETSOCKOPT.invokeExact(cap, fd, level, name, heap(value), valueLen));
+          cap, (int) SETSOCKOPT.invokeExact(cap, fd, level, name, offHeap(arena, value), valueLen));
     } catch (Throwable t) {
       throw rethrow(t);
     }

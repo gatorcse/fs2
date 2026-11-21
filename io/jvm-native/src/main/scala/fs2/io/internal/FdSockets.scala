@@ -63,7 +63,15 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     if (errno == c.EADDRINUSE || errno == c.EADDRNOTAVAIL) new BindException(msg)
     else if (errno == c.ECONNREFUSED || errno == c.ETIMEDOUT) new ConnectException(msg)
     else if (errno == c.EHOSTUNREACH || errno == c.ENETUNREACH) new NoRouteToHostException(msg)
-    else new IOException(s"errno($errno) $msg")
+    else new ErrnoException(errno, s"errno($errno) $msg")
+  }
+
+  /** Whether `t` is the error a socket option gets on macOS when the connection has already
+    * gone (`EINVAL` on a socket that can neither send nor receive any more).
+    */
+  def isGoneOnMac(t: Throwable): Boolean = t match {
+    case e: ErrnoException => c.isMac && e.errno == EINVAL
+    case _                 => false
   }
 
   /** Runs a system call, retrying on `EINTR`. Returns its result, or -1 if it would block; throws
@@ -103,7 +111,9 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     * IPv4 where IPv6 is unavailable. Returns the descriptor and its address family.
     */
   def openForBind[F[_]](host: IpAddress, tpe: Int)(implicit F: Sync[F]): Resource[F, (Int, Int)] =
-    if (host == Ipv4Address.Wildcard)
+    if (host == Ipv4Address.Wildcard && !ipv6Available)
+      openNonBlocking(c.AF_INET, tpe).map((_, c.AF_INET))
+    else if (host == Ipv4Address.Wildcard)
       Resource.make {
         F.delay {
           var fd = sys.socket(c.AF_INET6, tpe | c.SOCK_NONBLOCK_CLOEXEC, 0)
@@ -134,6 +144,21 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
       openNonBlocking(domain, tpe).map((_, domain))
     }
 
+  /** Like the JDK: IPv6 is in use only if some interface has an IPv6 address (it can be
+    * supported but disabled, e.g. `disable_ipv6`, and then `::` isn't reachable).
+    */
+  private[this] lazy val ipv6Available: Boolean =
+    try {
+      val ifaces = JNetworkInterface.getNetworkInterfaces
+      var found = false
+      while (!found && ifaces != null && ifaces.hasMoreElements) {
+        val addrs = ifaces.nextElement().getInetAddresses
+        while (!found && addrs.hasMoreElements)
+          found = addrs.nextElement().isInstanceOf[java.net.Inet6Address]
+      }
+      found
+    } catch { case _: Exception => false }
+
   private[this] def openRaw(domain: Int, tpe: Int): Int = {
     val fd = guard(sys.socket(domain, tpe | c.SOCK_NONBLOCK_CLOEXEC, 0))
     try configure(fd)
@@ -162,17 +187,20 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
       guardMask(sys.accept(fd, c.SOCK_NONBLOCK_CLOEXEC))(e =>
         e == c.ECONNABORTED || c.wouldBlock(e)
       )
-    var client = accept0()
-    while (client == -c.ECONNABORTED) client = accept0()
-    if (client < 0) client = -1 // would block
-    if (client >= 0)
-      try configure(client)
-      catch {
-        case t: Throwable =>
-          sys.close(client)
-          throw t
-      }
-    client
+    var client = -c.ECONNABORTED
+    while (client == -c.ECONNABORTED) {
+      client = accept0()
+      if (client >= 0)
+        try configure(client)
+        catch {
+          case t: Throwable =>
+            sys.close(client)
+            // macOS hands out connections that are already gone, and then refuses options
+            if (isGoneOnMac(t)) client = -c.ECONNABORTED else throw t
+        }
+    }
+    if (client < 0) -1 // would block
+    else client
   }
 
   /** What `SOCK_NONBLOCK | SOCK_CLOEXEC` don't do on this OS. */
@@ -262,7 +290,7 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     val len = Array(buf.length)
     // macOS reports EINVAL for a connection that's already gone
     val r = guardMask(sys.getpeername(fd, buf, len)) { e =>
-      e == c.ENOTCONN || e == c.ECONNRESET || (c.isMac && e == 22)
+      e == c.ENOTCONN || e == c.ECONNRESET || (c.isMac && e == EINVAL)
     }
     if (r < 0) null else decode(buf, len(0))
   }
@@ -728,9 +756,27 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
   def setOptionsF[F[_]](fd: Int, domain: Int, options: List[fs2.io.net.SocketOption])(implicit
       F: Sync[F]
   ): F[Unit] = options.traverse_(so => setOptionF(fd, domain, so.key, so.value))
+
+  /** Sets options on an accepted socket. `false` if the connection has gone already (macOS
+    * refuses options then), so that the caller drops it rather than failing the accept loop.
+    */
+  def setAcceptedOptionsF[F[_]](fd: Int, domain: Int, options: List[fs2.io.net.SocketOption])(
+      implicit F: Sync[F]
+  ): F[Boolean] =
+    setOptionsF(fd, domain, options).attempt.flatMap {
+      case Right(_)                  => F.pure(true)
+      case Left(t) if isGoneOnMac(t) => F.pure(false)
+      case Left(t)                   => F.raiseError(t)
+    }
 }
 
+/** An error from a system call, with its `errno`. */
+private[fs2] final class ErrnoException(val errno: Int, message: String)
+    extends java.net.SocketException(message)
+
 private[fs2] object FdSockets {
+  private final val EINVAL = 22 // on every supported OS
+
   private val NativeLittleEndian = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
 
   private def intBytes(value: Int): Array[Byte] =

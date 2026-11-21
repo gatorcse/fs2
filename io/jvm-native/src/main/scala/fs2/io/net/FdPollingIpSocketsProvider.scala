@@ -89,7 +89,7 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
     sockets = Stream
       .resource {
         // errors (e.g. out of descriptors, or an unsupported option) end the stream, like NIO's;
-        // only a client that has already reset its connection is dropped
+        // only a client that has already gone is dropped
         Resource
           .makeFull[F, Int] { poll =>
             poll {
@@ -104,18 +104,24 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
             }
           }(clientFd => F.delay(fds.close(clientFd)))
           .flatMap { clientFd =>
-            Resource.eval(fds.setOptionsF(clientFd, domain, filteredOptions)) >>
-              Resource.eval(F.delay(Option(fds.peerAddressIfConnected(clientFd)))).flatMap {
-                case None       => Resource.pure[F, Option[Socket[F]]](None)
-                case Some(peer) =>
-                  for {
-                    local <- Resource.eval(F.delay(fds.localAddress(clientFd)))
-                    handle <- poller
-                      .registerFileDescriptor(clientFd, true, true)
-                      .mapK(LiftIO.liftK)
-                    socket <- FdPollingSocket[F](fds, clientFd, domain, handle, local, peer)
-                  } yield Some(socket)
-              }
+            val connected = F.delay(Option(fds.peerAddressIfConnected(clientFd))).flatMap {
+              case None       => F.pure(Option.empty[GenSocketAddress])
+              case Some(peer) =>
+                fds
+                  .setAcceptedOptionsF(clientFd, domain, filteredOptions)
+                  .map(ok => if (ok) Some(peer) else None)
+            }
+            Resource.eval(connected).flatMap {
+              case None       => Resource.pure[F, Option[Socket[F]]](None)
+              case Some(peer) =>
+                for {
+                  local <- Resource.eval(F.delay(fds.localAddress(clientFd)))
+                  handle <- poller
+                    .registerFileDescriptor(clientFd, true, true)
+                    .mapK(LiftIO.liftK)
+                  socket <- FdPollingSocket[F](fds, clientFd, domain, handle, local, peer)
+                } yield Some(socket)
+            }
           }
       }
       .repeat

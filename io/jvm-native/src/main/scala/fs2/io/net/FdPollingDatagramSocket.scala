@@ -124,6 +124,7 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
     writeMutex.lock.surround {
       F.delay {
         gate {
+          if (peer ne null) throw DatagramConnectionErrors.alreadyConnected() // like NIO
           // connecting a datagram socket only sets its peer, so it never blocks
           if (!fds.connect(fd, address, domain))
             throw new IOException(s"Datagram connect to $address did not complete")
@@ -186,17 +187,20 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
         )
       }
       new GroupMembership {
+        // like NIO, dropping a membership of a closed socket does nothing
         def drop = F.delay {
-          gate.apply(
-            fds.multicast(
-              fd,
-              domain,
-              if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
-              index,
-              group,
-              source
+          try
+            gate.apply(
+              fds.multicast(
+                fd,
+                domain,
+                if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
+                index,
+                group,
+                source
+              )
             )
-          )
+          catch { case _: java.nio.channels.ClosedChannelException => () }
         }
         def block(blocked: IpAddress) = F.delay {
           if (source.isDefined)
