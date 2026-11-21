@@ -32,6 +32,7 @@ import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -46,14 +47,16 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  *
  * <p>Heap arrays are passed to the kernel without a copy: every call that takes one is
  * non-blocking and bound with {@code Linker.Option.critical(true)}, which pins the array for the
- * duration of the call. Calls that can block ({@code close} with {@code SO_LINGER}) are never
- * critical, since a critical call holds up safepoints.
+ * duration of the call. Calls that can block are never critical, since a critical call holds up
+ * safepoints: {@code close} (with {@code SO_LINGER}), and {@code bind} and {@code connect}, which
+ * look up or create a file for a Unix socket. Those copy their address off-heap instead.
  */
 public final class SocketCalls {
 
   private SocketCalls() {}
 
   public static final String OS = System.getProperty("os.name", "").toLowerCase();
+  public static final String ARCH = System.getProperty("os.arch", "").toLowerCase();
   public static final boolean IS_LINUX = OS.startsWith("linux");
   public static final boolean IS_MAC = OS.startsWith("mac") || OS.startsWith("darwin");
 
@@ -93,6 +96,13 @@ public final class SocketCalls {
     return a == null ? MemorySegment.NULL : MemorySegment.ofArray(a).asSlice(offset, length);
   }
 
+  private static MemorySegment offHeap(Arena arena, byte[] a) {
+    if (a == null) return MemorySegment.NULL;
+    MemorySegment seg = arena.allocate(Math.max(a.length, 1));
+    MemorySegment.copy(a, 0, seg, JAVA_BYTE, 0, a.length);
+    return seg;
+  }
+
   private static MemorySegment heap(byte[] a) {
     return a == null ? MemorySegment.NULL : MemorySegment.ofArray(a);
   }
@@ -127,8 +137,8 @@ public final class SocketCalls {
   private static final FunctionDescriptor I_IPP =
       FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS);
 
-  private static final MethodHandle BIND = bind("bind", I_IPI, CRITICAL_HEAP, CAPTURE);
-  private static final MethodHandle CONNECT = bind("connect", I_IPI, CRITICAL_HEAP, CAPTURE);
+  private static final MethodHandle BIND = bind("bind", I_IPI, CAPTURE);
+  private static final MethodHandle CONNECT = bind("connect", I_IPI, CAPTURE);
   private static final MethodHandle LISTEN =
       bind("listen", FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT), CRITICAL, CAPTURE);
 
@@ -228,8 +238,8 @@ public final class SocketCalls {
 
   public static int bind(int fd, byte[] addr, int addrLen) {
     MemorySegment cap = CAPTURE_TL.get();
-    try {
-      return ret(cap, (int) BIND.invokeExact(cap, fd, heap(addr), addrLen));
+    try (Arena arena = Arena.ofConfined()) {
+      return ret(cap, (int) BIND.invokeExact(cap, fd, offHeap(arena, addr), addrLen));
     } catch (Throwable t) {
       throw rethrow(t);
     }
@@ -246,8 +256,8 @@ public final class SocketCalls {
 
   public static int connect(int fd, byte[] addr, int addrLen) {
     MemorySegment cap = CAPTURE_TL.get();
-    try {
-      return ret(cap, (int) CONNECT.invokeExact(cap, fd, heap(addr), addrLen));
+    try (Arena arena = Arena.ofConfined()) {
+      return ret(cap, (int) CONNECT.invokeExact(cap, fd, offHeap(arena, addr), addrLen));
     } catch (Throwable t) {
       throw rethrow(t);
     }

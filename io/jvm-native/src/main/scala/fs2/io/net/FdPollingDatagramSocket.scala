@@ -49,6 +49,7 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
     fd: Int,
     domain: Int,
     handle: FileDescriptorPollHandle,
+    gate: FdGate,
     readMutex: Mutex[F],
     writeMutex: Mutex[F],
     override val address: SocketAddress[IpAddress]
@@ -56,6 +57,11 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
     extends DatagramSocket[F] {
 
   private[this] val c = fds.c
+
+  /** The peer, while connected. A connected socket sends to it without an address: macOS refuses
+    * (`EISCONN`) a `sendto` with an address on a connected socket, even the peer's.
+    */
+  @volatile private[this] var peer: GenSocketAddress = null
 
   def localAddress: F[SocketAddress[IpAddress]] = F.pure(address)
 
@@ -66,7 +72,8 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
           // the largest possible datagram; copied out before this fiber can suspend
           val buf = FdPollingSocket.scratchBuffer(MaxDatagramSize)
           val length = new Array[Int](1)
-          val from = fds.recvFrom(fd, buf, 0, math.min(buf.length, MaxDatagramSize), length)
+          val from =
+            gate(fds.recvFrom(fd, buf, 0, math.min(buf.length, MaxDatagramSize), length))
           // a zero-length datagram still has a sender
           if (from eq null) Left(())
           else
@@ -89,7 +96,12 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
         .pollWriteRec(()) { _ =>
           IO {
             // a datagram is sent whole or not at all
-            if (fds.sendTo(fd, buf, offset, length, to) >= 0) Either.unit else Left(())
+            val sent = gate {
+              val connectedTo = peer
+              val dest = if ((connectedTo ne null) && connectedTo == to) null else to
+              fds.sendTo(fd, domain, buf, offset, length, dest)
+            }
+            if (sent >= 0) Either.unit else Left(())
           }
         }
         .to
@@ -102,22 +114,34 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
   def writes: Pipe[F, Datagram, Nothing] = _.evalMap(write).drain
 
   def connect(address: GenSocketAddress): F[Unit] =
-    F.delay {
-      // connecting a datagram socket only sets its peer, so it never blocks
-      if (!fds.connect(fd, address))
-        throw new IOException(s"Datagram connect to $address did not complete")
+    writeMutex.lock.surround {
+      F.delay {
+        gate {
+          // connecting a datagram socket only sets its peer, so it never blocks
+          if (!fds.connect(fd, address, domain))
+            throw new IOException(s"Datagram connect to $address did not complete")
+          peer = address
+        }
+      }
     }
 
-  def disconnect: F[Unit] = F.delay(fds.disconnect(fd))
+  def disconnect: F[Unit] = writeMutex.lock.surround {
+    F.delay {
+      gate {
+        fds.disconnect(fd)
+        peer = null
+      }
+    }
+  }
 
   def getOption[A](key: SocketOption.Key[A]): F[Option[A]] =
-    fds.getOptionF[F, A](fd, domain, key)
+    F.delay(gate(fds.getOption(fd, domain, key)))
 
   def setOption[A](key: SocketOption.Key[A], value: A): F[Unit] =
-    fds.setOptionF[F, A](fd, domain, key, value)
+    F.delay(gate(fds.setOption(fd, domain, key, value)))
 
   def supportedOptions: F[Set[SocketOption.Key[?]]] =
-    F.pure(fds.supportedOptions(datagram = true))
+    F.pure(fds.supportedOptions(datagram = true, domain))
 
   override def join(
       join: MulticastJoin[IpAddress],
@@ -138,32 +162,34 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
         j => (j.group.address: IpAddress, None),
         j => (j.group.address: IpAddress, Some(j.source: IpAddress))
       )
-      fds.multicast(
-        fd,
-        if (source.isEmpty) c.MCAST_JOIN_GROUP else c.MCAST_JOIN_SOURCE_GROUP,
-        index,
-        group,
-        source
-      )
+      gate {
+        fds.multicast(
+          fd,
+          if (source.isEmpty) c.MCAST_JOIN_GROUP else c.MCAST_JOIN_SOURCE_GROUP,
+          index,
+          group,
+          source
+        )
+      }
       new GroupMembership {
         def drop = F.delay {
-          fds.multicast(
+          gate.apply(fds.multicast(
             fd,
             if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
             index,
             group,
             source
-          )
+          ))
         }
         def block(blocked: IpAddress) = F.delay {
           if (source.isDefined)
             throw new IllegalStateException("Cannot block sources of a source-specific join")
-          fds.multicast(fd, c.MCAST_BLOCK_SOURCE, index, group, Some(blocked))
+          gate(fds.multicast(fd, c.MCAST_BLOCK_SOURCE, index, group, Some(blocked)))
         }
         def unblock(blocked: IpAddress) = F.delay {
           if (source.isDefined)
             throw new IllegalStateException("Cannot unblock sources of a source-specific join")
-          fds.multicast(fd, c.MCAST_UNBLOCK_SOURCE, index, group, Some(blocked))
+          gate(fds.multicast(fd, c.MCAST_UNBLOCK_SOURCE, index, group, Some(blocked)))
         }
         override def toString = "GroupMembership"
       }
@@ -181,10 +207,19 @@ private object FdPollingDatagramSocket {
       domain: Int,
       handle: FileDescriptorPollHandle,
       address: SocketAddress[IpAddress]
-  )(implicit F: Async[F]): Resource[F, DatagramSocket[F]] =
-    Resource.eval((Mutex[F], Mutex[F]).mapN { (readMutex, writeMutex) =>
-      new FdPollingDatagramSocket(fds, fd, domain, handle, readMutex, writeMutex, address)
-    })
+  )(implicit F: Async[F]): Resource[F, DatagramSocket[F]] = for {
+    mutexes <- Resource.eval((Mutex[F], Mutex[F]).tupled)
+    gate <- FdGate.resource[F]
+  } yield new FdPollingDatagramSocket(
+    fds,
+    fd,
+    domain,
+    handle,
+    gate,
+    mutexes._1,
+    mutexes._2,
+    address
+  )
 }
 
 private final class FdPollingIpDatagramSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets)(implicit
@@ -197,18 +232,12 @@ private final class FdPollingIpDatagramSocketsProvider[F[_]: Dns: LiftIO](fds: F
   ): Resource[F, DatagramSocket[F]] = for {
     poller <- Resource.eval(fileDescriptorPoller[F])
     host <- Resource.eval(address.host.resolve[F])
-    bindTo = SocketAddress(host, address.port)
-    domain = fds.domainOf(bindTo)
-    fd <- fds.openNonBlocking(domain, fds.c.SOCK_DGRAM)
+    opened <- fds.openForBind(host, fds.c.SOCK_DGRAM)
+    (fd, domain) = opened
     _ <- Resource.eval(fds.setOptionsF(fd, domain, options))
-    _ <- Resource.eval(F.delay(fds.bind(fd, bindTo)))
+    _ <- Resource.eval(F.delay(fds.bind(fd, SocketAddress(host, address.port), domain)))
     handle <- poller.registerFileDescriptor(fd, true, true).mapK(LiftIO.liftK)
-    socket <- FdPollingDatagramSocket[F](
-      fds,
-      fd,
-      domain,
-      handle,
-      fds.localAddress(fd).asIpUnsafe
-    )
+    localAddress <- Resource.eval(F.delay(fds.localAddress(fd).asIpUnsafe))
+    socket <- FdPollingDatagramSocket[F](fds, fd, domain, handle, localAddress)
   } yield socket
 }

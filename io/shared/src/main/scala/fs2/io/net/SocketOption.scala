@@ -83,11 +83,13 @@ object SocketOption extends SocketOptionCompanionPlatform {
       }
     }
 
+    // an abstract name (Linux) has no file to delete
+    val isAbstract = address.path.startsWith("\u0000")
     val deleteIfExistsAction =
-      Files[F].deleteIfExists(Path(address.path)).whenA(deleteIfExists)
+      Files[F].deleteIfExists(Path(address.path)).whenA(deleteIfExists && !isAbstract)
     val deleteOnCloseResource =
       Resource.make(Applicative[F].unit)(_ =>
-        Files[F].deleteIfExists(Path(address.path)).whenA(deleteOnClose)
+        Files[F].deleteIfExists(Path(address.path)).whenA(deleteOnClose && !isAbstract)
       )
 
     (filteredOptions, deleteIfExistsAction, deleteOnCloseResource)

@@ -63,14 +63,8 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
         }
         .to
     }
-    socket <- FdPollingSocket[F](
-      fds,
-      fd,
-      domain,
-      handle,
-      fds.localAddress(fd),
-      fds.peerAddress(fd)
-    )
+    addresses <- Resource.eval(F.delay((fds.localAddress(fd), fds.peerAddress(fd))))
+    socket <- FdPollingSocket[F](fds, fd, domain, handle, addresses._1, addresses._2)
   } yield socket
 
   override def bindIp(
@@ -80,20 +74,23 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
     poller <- Resource.eval(fileDescriptorPoller[F])
     (filteredOptions, backlog) = SocketOption.extractBacklog(options)
     resolvedHost <- Resource.eval(address.host.resolve)
-    domain = fds.domainOf(SocketAddress(resolvedHost, address.port))
-    fd <- fds.openNonBlocking(domain, c.SOCK_STREAM)
+    opened <- fds.openForBind(resolvedHost, c.SOCK_STREAM)
+    (fd, domain) = opened
     handle <- poller.registerFileDescriptor(fd, true, false).mapK(LiftIO.liftK)
 
     _ <- Resource.eval {
       F.delay(fds.setInt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, 1)) *>
-        F.delay(fds.bind(fd, SocketAddress(resolvedHost, address.port))) *>
+        F.delay(fds.bind(fd, SocketAddress(resolvedHost, address.port), domain)) *>
         F.delay(fds.listen(fd, backlog.getOrElse(SoMaxConn)))
     }
+    localAddress <- Resource.eval(F.delay(fds.localAddress(fd)))
 
     sockets = Stream
       .resource {
-        val accepted = for {
-          clientFd <- Resource.makeFull[F, Int] { poll =>
+        // accept errors (e.g. out of descriptors) end the stream, like NIO's; a client that
+        // fails to set up (e.g. it reset the connection already) is dropped
+        Resource
+          .makeFull[F, Int] { poll =>
             poll {
               handle
                 .pollReadRec(()) { _ =>
@@ -105,19 +102,24 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
                 .to
             }
           }(clientFd => F.delay(fds.close(clientFd)))
-          _ <- Resource.eval(fds.setOptionsF(clientFd, domain, filteredOptions))
-          handle <- poller.registerFileDescriptor(clientFd, true, true).mapK(LiftIO.liftK)
-          socket <- FdPollingSocket[F](
-            fds,
-            clientFd,
-            domain,
-            handle,
-            fds.localAddress(clientFd),
-            fds.peerAddress(clientFd)
-          )
-        } yield socket
-
-        accepted.attempt.map(_.toOption)
+          .flatMap { clientFd =>
+            val socket = for {
+              _ <- Resource.eval(fds.setOptionsF(clientFd, domain, filteredOptions))
+              handle <- poller.registerFileDescriptor(clientFd, true, true).mapK(LiftIO.liftK)
+              addresses <- Resource.eval(
+                F.delay((fds.localAddress(clientFd), fds.peerAddress(clientFd)))
+              )
+              socket <- FdPollingSocket[F](
+                fds,
+                clientFd,
+                domain,
+                handle,
+                addresses._1,
+                addresses._2
+              )
+            } yield socket
+            socket.attempt.map(_.toOption)
+          }
       }
       .repeat
       .unNone
@@ -126,8 +128,8 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
       def getOption[A](key: SocketOption.Key[A]) = fds.getOptionF[F, A](fd, domain, key)
       def setOption[A](key: SocketOption.Key[A], value: A) =
         fds.setOptionF[F, A](fd, domain, key, value)
-      def supportedOptions = F.pure(fds.supportedOptions(datagram = false))
-      val address = fds.localAddress(fd)
+      def supportedOptions = F.pure(fds.supportedOptions(datagram = false, domain))
+      val address = localAddress
     }
   } yield ServerSocket(info, sockets)
 

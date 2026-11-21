@@ -53,8 +53,8 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](fds: FdSoc
           .pollWriteRec(false) { connecting =>
             IO {
               if (connecting) {
-                fds.checkSocketError(fd)
-                Either.unit
+                // writability alone doesn't prove the connection completed
+                if (fds.finishConnect(fd)) Either.unit else Left(true)
               } else if (fds.connect(fd, address)) Either.unit
               else Left(true) // we will be connected when unblocked
             }
@@ -97,14 +97,16 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](fds: FdSoc
         def getOption[A](key: SocketOption.Key[A]) = fds.getOptionF[F, A](fd, c.AF_UNIX, key)
         def setOption[A](key: SocketOption.Key[A], value: A) =
           fds.setOptionF[F, A](fd, c.AF_UNIX, key, value)
-        def supportedOptions = F.pure(fds.supportedOptions(datagram = false))
+        def supportedOptions = F.pure(fds.supportedOptions(datagram = false, c.AF_UNIX))
         val address = address0
       }
 
       clients = Stream
         .resource {
-          val accepted = for {
-            fd <- Resource.makeFull[F, Int] { poll =>
+          // accept errors (e.g. out of descriptors) end the stream, like NIO's; a client that
+          // fails to set up is dropped
+          Resource
+            .makeFull[F, Int] { poll =>
               poll {
                 handle
                   .pollReadRec(()) { _ =>
@@ -116,20 +118,21 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](fds: FdSoc
                   .to
               }
             }(fd => F.delay(fds.close(fd)))
-
-            _ <- Resource.eval(fds.setOptionsF(fd, c.AF_UNIX, filteredOptions))
-            handle <- poller.registerFileDescriptor(fd, true, true).mapK(LiftIO.liftK)
-            socket <- FdPollingSocket[F](
-              fds,
-              fd,
-              c.AF_UNIX,
-              handle,
-              address,
-              UnixSocketAddress("")
-            )
-          } yield socket
-
-          accepted.attempt.map(_.toOption)
+            .flatMap { clientFd =>
+              val socket = for {
+                _ <- Resource.eval(fds.setOptionsF(clientFd, c.AF_UNIX, filteredOptions))
+                handle <- poller.registerFileDescriptor(clientFd, true, true).mapK(LiftIO.liftK)
+                socket <- FdPollingSocket[F](
+                  fds,
+                  clientFd,
+                  c.AF_UNIX,
+                  handle,
+                  address,
+                  UnixSocketAddress("")
+                )
+              } yield socket
+              socket.attempt.map(_.toOption)
+            }
         }
         .repeat
         .unNone

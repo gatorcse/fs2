@@ -37,8 +37,9 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
     fd: Int,
     domain: Int,
     handle: FileDescriptorPollHandle,
+    gate: FdGate,
     readMutex: Mutex[F],
-    val isOpen: F[Boolean],
+    writeMutex: Mutex[F],
     val address: GenSocketAddress,
     val peerAddress: GenSocketAddress
 )(implicit F: Async[F])
@@ -49,8 +50,10 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
   def localAddress = F.pure(address.asIpUnsafe)
   def remoteAddress = F.pure(peerAddress.asIpUnsafe)
 
-  def endOfInput: F[Unit] = F.delay(fds.shutdown(fd, fds.c.SHUT_RD))
-  def endOfOutput: F[Unit] = F.delay(fds.shutdown(fd, fds.c.SHUT_WR))
+  def isOpen: F[Boolean] = F.delay(gate.isOpen)
+
+  def endOfInput: F[Unit] = F.delay(gate(fds.shutdown(fd, fds.c.SHUT_RD)))
+  def endOfOutput: F[Unit] = F.delay(gate(fds.shutdown(fd, fds.c.SHUT_WR)))
 
   /** Reads up to `max` bytes in to the current thread's scratch buffer, without waiting for the
     * file descriptor to become readable. Returns the buffer and the result of `read(2)` (-1 if
@@ -62,10 +65,14 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
   private def readScratch(max: Int): (Array[Byte], Int) = {
     val buf = scratchBuffer(max)
     val len = math.min(max, MaxScratchSize)
-    (buf, fds.guard(sys.read(fd, buf, 0, len)))
+    (buf, gate(fds.guard(sys.read(fd, buf, 0, len))))
   }
 
-  def read(maxBytes: Int): F[Option[Chunk[Byte]]] = readMutex.lock.surround {
+  def read(maxBytes: Int): F[Option[Chunk[Byte]]] =
+    // a zero-length read(2) would look like end-of-stream
+    if (maxBytes <= 0) F.pure(Some(Chunk.empty)) else read0(maxBytes)
+
+  private[this] def read0(maxBytes: Int): F[Option[Chunk[Byte]]] = readMutex.lock.surround {
     handle
       .pollReadRec(()) { _ =>
         IO {
@@ -81,7 +88,10 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
       .to
   }
 
-  def readN(numBytes: Int): F[Chunk[Byte]] = readMutex.lock.surround {
+  def readN(numBytes: Int): F[Chunk[Byte]] =
+    if (numBytes <= 0) F.pure(Chunk.empty) else readN0(numBytes)
+
+  private[this] def readN0(numBytes: Int): F[Chunk[Byte]] = readMutex.lock.surround {
     // Until the first bytes arrive, reads go to the scratch buffer, so that a socket waiting for
     // data doesn't hold on to an array. After that, `dest` is allocated with size `numBytes` and
     // the rest is read straight in to it.
@@ -94,7 +104,7 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
             System.arraycopy(buf, 0, target, 0, readed)
             (target, readed)
           } else (dest, readed)
-        } else (dest, fds.guard(sys.read(fd, dest, pos, numBytes - pos)))
+        } else (dest, gate(fds.guard(sys.read(fd, dest, pos, numBytes - pos))))
       }.flatMap { case (next, readed) =>
         if (readed > 0) {
           val newPos = pos + readed
@@ -118,7 +128,7 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
     val Chunk.ArraySlice(buf, offset, length) = bytes.toArraySlice
 
     def writeNext(pos: Int): IO[Either[Int, Int]] =
-      IO(fds.guard(sys.write(fd, buf, offset + pos, length - pos))).map { wrote =>
+      IO(gate(fds.guard(sys.write(fd, buf, offset + pos, length - pos)))).map { wrote =>
         if (wrote >= 0)
           Right(wrote)
         else
@@ -137,17 +147,18 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
         }
       }
 
-    writeAll(0).stream
+    // one writer at a time, for the whole chunk, so that concurrent writes don't interleave
+    Stream.resource(writeMutex.lock) >> writeAll(0).stream
   }
 
   def writes: Pipe[F, Byte, Nothing] = _.chunks.foreach(write(_))
 
-  def getOption[A](key: SocketOption.Key[A]) = fds.getOptionF[F, A](fd, domain, key)
+  def getOption[A](key: SocketOption.Key[A]) = F.delay(gate(fds.getOption(fd, domain, key)))
 
   def setOption[A](key: SocketOption.Key[A], value: A) =
-    fds.setOptionF[F, A](fd, domain, key, value)
+    F.delay(gate(fds.setOption(fd, domain, key, value)))
 
-  def supportedOptions = F.pure(fds.supportedOptions(datagram = false))
+  def supportedOptions = F.pure(fds.supportedOptions(datagram = false, domain))
 }
 
 private object FdPollingSocket {
@@ -186,6 +197,17 @@ private object FdPollingSocket {
       peerAddress: GenSocketAddress
   )(implicit F: Async[F]): Resource[F, Socket[F]] = for {
     readMutex <- Resource.eval(Mutex[F])
-    isOpen <- Resource.make(F.ref(true))(_.set(false))
-  } yield new FdPollingSocket(fds, fd, domain, handle, readMutex, isOpen.get, address, peerAddress)
+    writeMutex <- Resource.eval(Mutex[F])
+    gate <- FdGate.resource[F]
+  } yield new FdPollingSocket(
+    fds,
+    fd,
+    domain,
+    handle,
+    gate,
+    readMutex,
+    writeMutex,
+    address,
+    peerAddress
+  )
 }

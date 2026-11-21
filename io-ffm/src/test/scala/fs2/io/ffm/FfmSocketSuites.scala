@@ -67,6 +67,10 @@ class FfmUdpSuite extends UdpSuite {
   }
 }
 
+class FfmFdPollingSuite extends FdPollingSuite {
+  override def munitIORuntime: IORuntime = FfmRuntime.runtime
+}
+
 class FfmTLSSocketSuite extends TLSSocketSuite {
   override def munitIORuntime: IORuntime = FfmRuntime.runtime
 }

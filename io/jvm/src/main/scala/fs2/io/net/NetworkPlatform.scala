@@ -90,13 +90,14 @@ private[net] trait NetworkCompanionPlatform extends NetworkLowPriority { self: N
         * `cats-effect-ffm` polling systems) and `fs2-io-ffm` is on the classpath.
         */
       private def tryGetFdSockets: F[Option[FdSockets]] =
-        SocketSyscallsLoader.sockets match {
-          case None            => Async[F].pure(None)
-          case found @ Some(_) =>
-            IO.pollers
-              .map(ps => if (ps.exists(_.isInstanceOf[FileDescriptorPoller])) found else None)
-              .to[F]
-        }
+        // the poller first: loading `fs2-io-ffm` binds native functions, which the JDK warns
+        // about unless native access is enabled, so don't load it for a runtime that can't use it
+        IO.pollers
+          .map { ps =>
+            if (ps.exists(_.isInstanceOf[FileDescriptorPoller])) SocketSyscallsLoader.sockets
+            else None
+          }
+          .to[F]
 
       private def fdPolling[A](
           ifFdPolling: FdSockets => Resource[F, A],

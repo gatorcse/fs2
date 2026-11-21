@@ -96,18 +96,47 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     * when the resource is released.
     */
   def openNonBlocking[F[_]](domain: Int, tpe: Int)(implicit F: Sync[F]): Resource[F, Int] =
-    Resource.make {
-      F.delay {
-        val fd = guard(sys.socket(domain, tpe | c.SOCK_NONBLOCK_CLOEXEC, 0))
-        try configure(fd)
-        catch {
-          case t: Throwable =>
-            sys.close(fd)
-            throw t
+    Resource.make(F.delay(openRaw(domain, tpe)))(fd => F.delay(close(fd)))
+
+  /** Opens a socket to bind to `host`. The IPv4 wildcard opens a dual-stack IPv6 socket, like
+    * the JDK, so that a server on the default address also accepts IPv6 clients; it falls back to
+    * IPv4 where IPv6 is unavailable. Returns the descriptor and its address family.
+    */
+  def openForBind[F[_]](host: IpAddress, tpe: Int)(implicit F: Sync[F]): Resource[F, (Int, Int)] =
+    if (host == Ipv4Address.Wildcard)
+      Resource.make {
+        F.delay {
+          var fd = sys.socket(c.AF_INET6, tpe | c.SOCK_NONBLOCK_CLOEXEC, 0)
+          if (fd == -c.EAFNOSUPPORT) (openRaw(c.AF_INET, tpe), c.AF_INET)
+          else {
+            fd = guard(fd)
+            try {
+              configure(fd)
+              setInt(fd, c.IPPROTO_IPV6, c.IPV6_V6ONLY, 0)
+            } catch {
+              case t: Throwable =>
+                sys.close(fd)
+                throw t
+            }
+            (fd, c.AF_INET6)
+          }
         }
-        fd
-      }
-    }(fd => F.delay(close(fd)))
+      }(fd => F.delay(close(fd._1)))
+    else {
+      val domain = if (host.isInstanceOf[Ipv4Address]) c.AF_INET else c.AF_INET6
+      openNonBlocking(domain, tpe).map((_, domain))
+    }
+
+  private[this] def openRaw(domain: Int, tpe: Int): Int = {
+    val fd = guard(sys.socket(domain, tpe | c.SOCK_NONBLOCK_CLOEXEC, 0))
+    try configure(fd)
+    catch {
+      case t: Throwable =>
+        sys.close(fd)
+        throw t
+    }
+    fd
+  }
 
   /** Closes `fd`. `EINTR` is not retried: the descriptor is released either way on Linux and
     * macOS, and it may already be reused.
@@ -121,7 +150,12 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     * is pending.
     */
   def accept(fd: Int): Int = {
-    val client = guard(sys.accept(fd, c.SOCK_NONBLOCK_CLOEXEC))
+    // ECONNABORTED: a pending connection was reset before we took it; take the next one
+    def accept0() =
+      guardMask(sys.accept(fd, c.SOCK_NONBLOCK_CLOEXEC))(e => e == c.ECONNABORTED || c.wouldBlock(e))
+    var client = accept0()
+    while (client == -c.ECONNABORTED) client = accept0()
+    if (client < 0) client = -1 // would block
     if (client >= 0)
       try configure(client)
       catch {
@@ -146,8 +180,11 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     guard_(sys.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK))
   }
 
-  def bind(fd: Int, address: GenSocketAddress): Unit = {
-    val addr = encode(address)
+  def bind(fd: Int, address: GenSocketAddress): Unit = bind(fd, address, familyOfAddress(address))
+
+  /** Binds `fd`, a socket of address family `domain`. */
+  def bind(fd: Int, address: GenSocketAddress, domain: Int): Unit = {
+    val addr = encode(address, domain)
     guard_(sys.bind(fd, addr, addr.length))
   }
 
@@ -156,12 +193,15 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
   /** Starts connecting. Returns `true` if connected, `false` if the connection is in progress
     * (wait for writability, then call [[finishConnect]]).
     */
-  def connect(fd: Int, address: GenSocketAddress): Boolean = {
-    val addr = encode(address)
-    val r = guardMask(sys.connect(fd, addr, addr.length)) { e =>
-      e == c.EINPROGRESS || c.wouldBlock(e)
-    }
-    r >= 0
+  def connect(fd: Int, address: GenSocketAddress): Boolean =
+    connect(fd, address, familyOfAddress(address))
+
+  /** [[connect]] on a socket of address family `domain`. Only `EINPROGRESS` means the connection
+    * is under way: `EAGAIN` (a full Unix listen backlog, or no free local port) is an error.
+    */
+  def connect(fd: Int, address: GenSocketAddress, domain: Int): Boolean = {
+    val addr = encode(address, domain)
+    guardMask(sys.connect(fd, addr, addr.length))(_ == c.EINPROGRESS) >= 0
   }
 
   /** After a non-blocking connect signalled writability: throws the connect error if there was
@@ -210,11 +250,28 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
   def domainOf(address: SocketAddress[IpAddress]): Int =
     if (address.host.isInstanceOf[Ipv4Address]) c.AF_INET else c.AF_INET6
 
+  private[this] def familyOfAddress(address: GenSocketAddress): Int = address match {
+    case ip: SocketAddress[?] =>
+      if (ip.host.isInstanceOf[Ipv4Address]) c.AF_INET else c.AF_INET6
+    case _ => c.AF_UNIX
+  }
+
   // sockaddr
 
-  def encode(address: GenSocketAddress): Array[Byte] = address match {
+  def encode(address: GenSocketAddress): Array[Byte] = encode(address, familyOfAddress(address))
+
+  /** Encodes `address` for a socket of address family `domain`: an IPv4 address for an IPv6
+    * (dual-stack) socket becomes IPv4-mapped, and the IPv4 wildcard becomes `::`.
+    */
+  def encode(address: GenSocketAddress, domain: Int): Array[Byte] = address match {
     case ip: SocketAddress[?] =>
       ip.host match {
+        case v4: Ipv4Address if domain == c.AF_INET6 =>
+          encodeIn6(
+            if (v4 == Ipv4Address.Wildcard) Ipv6Address.fromBytes(new Array[Byte](16)).get
+            else v4.toMappedV6,
+            ip.port
+          )
         case v4: Ipv4Address => encodeIn(v4, ip.port)
         case v6: Ipv6Address => encodeIn6(v6, ip.port)
         case other           =>
@@ -303,12 +360,18 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     } else if (family == c.AF_INET6) {
       val port = ((buf(2) & 0xff) << 8) | (buf(3) & 0xff)
       val host = Ipv6Address.fromBytes(java.util.Arrays.copyOfRange(buf, 8, 24)).get
-      SocketAddress(host, Port.fromInt(port).get)
+      // like the JDK, a dual-stack socket's IPv4 peers are IPv4 addresses
+      SocketAddress(host.collapseMappedV4, Port.fromInt(port).get)
     } else if (family == c.AF_UNIX) {
-      // unnamed sockets have no path at all
-      var end = 2
-      while (end < len && buf(end) != 0) end += 1
-      UnixSocketAddress(new String(buf, 2, end - 2, StandardCharsets.UTF_8))
+      if (len > 2 && buf(2) == 0)
+        // an abstract name (Linux): every byte up to `len` is part of it
+        UnixSocketAddress(new String(buf, 2, len - 2, StandardCharsets.UTF_8))
+      else {
+        // unnamed sockets have no path at all
+        var end = 2
+        while (end < len && buf(end) != 0) end += 1
+        UnixSocketAddress(new String(buf, 2, end - 2, StandardCharsets.UTF_8))
+      }
     } else throw new UnsupportedOperationException(s"Unsupported address family $family")
   }
 
@@ -321,13 +384,18 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     decodeOptionInt(buf, len(0))
   }
 
-  /** `None` if the option isn't available on this socket (`ENOPROTOOPT`). */
+  /** `None` if the option isn't available on this socket (`ENOPROTOOPT`, or `EOPNOTSUPP` for an
+    * option of another protocol).
+    */
   def getIntOption(fd: Int, level: Int, name: Int): Option[Int] = {
     val buf = new Array[Byte](4)
     val len = Array(4)
-    if (guardMask(sys.getsockopt(fd, level, name, buf, len))(_ == c.ENOPROTOOPT) < 0) None
+    if (guardMask(sys.getsockopt(fd, level, name, buf, len))(unsupportedOption) < 0) None
     else Some(decodeOptionInt(buf, len(0)))
   }
+
+  private[this] def unsupportedOption(errno: Int): Boolean =
+    errno == c.ENOPROTOOPT || errno == c.EOPNOTSUPP || errno == c.ENOTSUP
 
   def setInt(fd: Int, level: Int, name: Int, value: Int): Unit = {
     val buf = intBytes(value)
@@ -343,8 +411,9 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     else ByteBuffer.wrap(buf).order(ByteOrder.nativeOrder()).getInt(0)
 
   /** The options a socket of this kind supports. */
-  def supportedOptions(datagram: Boolean): Set[SocketOption[?]] =
+  def supportedOptions(datagram: Boolean, domain: Int): Set[SocketOption[?]] =
     if (datagram) DatagramOptions
+    else if (domain == c.AF_UNIX) UnixStreamOptions
     else if (c.isLinux) StreamOptions + fs2.io.net.SocketOption.OriginalDestination
     else StreamOptions
 
@@ -430,19 +499,31 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
         val bb = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder())
         if (int >= 0) bb.putInt(0, 1).putInt(4, int) else bb.putInt(0, 0).putInt(4, 0)
         guard_(sys.setsockopt(fd, c.SOL_SOCKET, c.SO_LINGER, bb.array, 8))
+      // Linux sends IPv4 traffic from a dual-stack socket with its IPv4 options, so, like the
+      // JDK, an IPv6 socket there also gets the IPv4 option (best effort)
       case StandardSocketOptions.IP_TOS =>
-        if (v6) setInt(fd, c.IPPROTO_IPV6, c.IPV6_TCLASS, int)
-        else setInt(fd, c.IPPROTO_IP, c.IP_TOS, int)
+        if (v6) {
+          setInt(fd, c.IPPROTO_IPV6, c.IPV6_TCLASS, int)
+          if (c.isLinux) bestEffort(fd, c.IPPROTO_IP, c.IP_TOS, intBytes(int))
+        } else setInt(fd, c.IPPROTO_IP, c.IP_TOS, int)
       case StandardSocketOptions.IP_MULTICAST_TTL =>
-        if (v6) setInt(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_HOPS, int)
-        else setByte(fd, c.IPPROTO_IP, c.IP_MULTICAST_TTL, int)
+        if (v6) {
+          setInt(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_HOPS, int)
+          if (c.isLinux) bestEffort(fd, c.IPPROTO_IP, c.IP_MULTICAST_TTL, intBytes(int))
+        } else setByte(fd, c.IPPROTO_IP, c.IP_MULTICAST_TTL, int)
       case StandardSocketOptions.IP_MULTICAST_LOOP =>
-        if (v6) setInt(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_LOOP, bool)
-        else setByte(fd, c.IPPROTO_IP, c.IP_MULTICAST_LOOP, bool)
+        if (v6) {
+          setInt(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_LOOP, bool)
+          if (c.isLinux) bestEffort(fd, c.IPPROTO_IP, c.IP_MULTICAST_LOOP, intBytes(bool))
+        } else setByte(fd, c.IPPROTO_IP, c.IP_MULTICAST_LOOP, bool)
       case StandardSocketOptions.IP_MULTICAST_IF =>
         val iface = value.asInstanceOf[JNetworkInterface]
-        if (v6) setInt(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_IF, iface.getIndex)
-        else {
+        if (v6) {
+          setInt(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_IF, iface.getIndex)
+          if (c.isLinux) ipv4AddressOf(iface).foreach { addr =>
+            bestEffort(fd, c.IPPROTO_IP, c.IP_MULTICAST_IF, addr.toBytes)
+          }
+        } else {
           val addr = ipv4AddressOf(iface).getOrElse(
             throw new IOException(s"Interface ${iface.getName} has no IPv4 address")
           )
@@ -451,6 +532,12 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
       case _ =>
         throw new IllegalArgumentException(s"Unsupported socket option: ${key.name}")
     }
+  }
+
+  /** Sets an option, ignoring failure. */
+  private[this] def bestEffort(fd: Int, level: Int, name: Int, value: Array[Byte]): Unit = {
+    sys.setsockopt(fd, level, name, value, value.length)
+    ()
   }
 
   private[this] def ipv4AddressOf(iface: JNetworkInterface): Option[Ipv4Address] = {
@@ -518,16 +605,26 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     */
   def sendTo(
       fd: Int,
+      domain: Int,
       buf: Array[Byte],
       offset: Int,
       length: Int,
       address: GenSocketAddress
-  ): Int =
-    if (address eq null) guard(sys.sendto(fd, buf, offset, length, c.MSG_NOSIGNAL, null, 0))
-    else {
-      val addr = encode(address)
-      guard(sys.sendto(fd, buf, offset, length, c.MSG_NOSIGNAL, addr, addr.length))
-    }
+  ): Int = {
+    val mask = (e: Int) => e == c.ECONNREFUSED || c.wouldBlock(e)
+    val r =
+      if (address eq null)
+        guardMask(sys.sendto(fd, buf, offset, length, c.MSG_NOSIGNAL, null, 0))(mask)
+      else {
+        val addr = encode(address, domain)
+        guardMask(sys.sendto(fd, buf, offset, length, c.MSG_NOSIGNAL, addr, addr.length))(mask)
+      }
+    if (r == -c.ECONNREFUSED)
+      // a connected datagram socket's peer has no listener (ICMP port unreachable)
+      throw new PortUnreachableException(sys.strerror(c.ECONNREFUSED))
+    else if (r < 0) -1 // would block
+    else r
+  }
 
   /** Dissolves a datagram socket's association (`connect` to `AF_UNSPEC`). */
   def disconnect(fd: Int): Unit = {
@@ -568,6 +665,12 @@ private[fs2] object FdSockets {
     StandardSocketOptions.SO_LINGER,
     StandardSocketOptions.TCP_NODELAY,
     StandardSocketOptions.IP_TOS
+  )
+
+  private val UnixStreamOptions: Set[SocketOption[?]] = Set(
+    StandardSocketOptions.SO_SNDBUF,
+    StandardSocketOptions.SO_RCVBUF,
+    StandardSocketOptions.SO_LINGER
   )
 
   private val DatagramOptions: Set[SocketOption[?]] = Set(

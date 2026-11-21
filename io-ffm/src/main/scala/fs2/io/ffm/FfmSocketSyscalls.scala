@@ -37,9 +37,13 @@ import fs2.io.ffm.internal.SocketCalls
 final class FfmSocketSyscalls extends SocketSyscalls {
 
   val constants: SocketConstants =
-    if (SocketCalls.IS_LINUX) SocketConstants.Linux
+    if (SocketCalls.IS_LINUX && FfmSocketSyscalls.GenericLinuxArchs(SocketCalls.ARCH))
+      SocketConstants.Linux
     else if (SocketCalls.IS_MAC) SocketConstants.Darwin
-    else throw new UnsupportedOperationException(s"fs2-io-ffm doesn't support ${SocketCalls.OS}")
+    else
+      throw new UnsupportedOperationException(
+        s"fs2-io-ffm doesn't support ${SocketCalls.OS} on ${SocketCalls.ARCH}"
+      )
 
   private[this] val msgNoSignal = constants.MSG_NOSIGNAL
 
@@ -99,4 +103,12 @@ final class FfmSocketSyscalls extends SocketSyscalls {
   def shutdown(fd: Int, how: Int): Int = SocketCalls.shutdown(fd, how)
 
   def strerror(errno: Int): String = SocketCalls.strerror(errno)
+}
+
+private object FfmSocketSyscalls {
+
+  /** The architectures whose Linux ABI uses the generic constants (`SocketConstants.Linux`);
+    * MIPS, SPARC, PowerPC and others differ.
+    */
+  private val GenericLinuxArchs = Set("amd64", "x86_64", "aarch64", "arm64", "riscv64")
 }
