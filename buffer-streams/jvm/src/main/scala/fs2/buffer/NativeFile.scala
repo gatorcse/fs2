@@ -76,6 +76,9 @@ private[buffer] final class NativeFile private (
   /** The file's size, or 0 for a pipe or device. */
   def size: Long = ch.size()
 
+  /** Whether this is a regular file (not a directory, pipe or device). */
+  def isRegularFile: Boolean = java.nio.file.Files.isRegularFile(path)
+
   /** Whether this is the same file as `path`, if `path` exists. */
   def isSameFile(path: Path): Boolean =
     java.nio.file.Files

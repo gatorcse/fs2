@@ -146,6 +146,13 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
     if (stat.S_ISREG(st.st_mode) != 0) st.st_size.toLong else 0L
   }
 
+  /** Whether this is a regular file (not a directory, pipe or device). */
+  def isRegularFile: Boolean = {
+    val st = stackalloc[stat.stat]()
+    if (stat.fstat(fd, st) != 0) throw NativeFile.error("fstat")
+    stat.S_ISREG(st.st_mode) != 0
+  }
+
   /** Whether this is the same file as `path`, if `path` exists. */
   def isSameFile(path: Path): Boolean = {
     val mine = stackalloc[stat.stat]()
@@ -158,7 +165,8 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
   // On Linux the descriptor is released even when close fails with EINTR, so that is not
   // an error and must not be retried.
   def close(): Unit =
-    if (unistd.close(fd) != 0 && errno.errno != EINTR) throw NativeFile.error("close")
+    if (NativeFile.blockingCalls.close(fd) != 0 && errno.errno != EINTR)
+      throw NativeFile.error("close")
 }
 
 private[buffer] object NativeFile {
@@ -178,7 +186,7 @@ private[buffer] object NativeFile {
       var done = false
       // Opening a FIFO blocks until the other end opens, so a signal can interrupt it.
       while (!done) {
-        fd = fcntl.open(p, flags | fcntl.O_CLOEXEC, Mode)
+        fd = blockingCalls.open(p, flags | fcntl.O_CLOEXEC, Mode)
         done = fd >= 0 || errno.errno != EINTR
       }
       fd
@@ -199,6 +207,20 @@ private[buffer] object NativeFile {
 
   private[buffer] def error(what: String): IOException =
     new IOException(s"$what: ${fromCString(string.strerror(errno.errno))}")
+
+  /** `open` and `close` marked blocking. posixlib's are not, and opening a FIFO waits for
+    * the other end (as can open or close on a hung network filesystem); an unmarked call
+    * would hold up every other thread's stop-the-world GC for that long.
+    */
+  @nowarn212("cat=unused")
+  @extern
+  private object blockingCalls {
+    @blocking @name("scalanative_open_m")
+    def open(pathname: CString, flags: CInt, mode: CUnsignedInt): CInt = extern
+
+    @blocking
+    def close(fd: CInt): CInt = extern
+  }
 
   @nowarn212("cat=unused")
   @extern

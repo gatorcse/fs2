@@ -41,7 +41,8 @@ import scodec.bits.{BitVector, ByteVector}
   *   - holds more chunks than that: `chunkN` with a large `n`, `buffer`, `compile.to(Chunk)`,
   *     `.chunks.compile.toList`, `groupWithin`, `sliding`;
   *   - emits chunks after the source has ended: the last group of `chunkN`, `bufferAll`,
-  *     `groupAdjacentBy`, `split`, `takeRight`;
+  *     `groupAdjacentBy`, `split`, `takeRight`, and `text.utf8.decode` or
+  *     `text.decodeWithCharset` when input ends mid-character or mid-byte-order-mark;
   *   - hands chunks to another fiber: `merge`, `parEvalMap`, `parJoin`, `prefetch`,
   *     `broadcastThrough`, `observeAsync`, `Channel`, `Topic`, fs2-io's `toInputStream`,
   *     or a stream run in the background of `concurrently`.
@@ -55,10 +56,11 @@ import scodec.bits.{BitVector, ByteVector}
   * This is a convention the types do not enforce. What a stale chunk does depends on the
   * allocator's checks level:
   *   - Bulk (the default): copies, writes, hashing, `iterator`, `foreach` and `map` throw
-  *     `IllegalStateException`; a single-byte `apply` is not checked. It reads whatever the
+  *     `IllegalStateException`. Other element access (`apply`, `head`, `last`,
+  *     `zipWithIndex`, `collect`, `traverse`...) is not checked: it reads whatever the
   *     buffer holds next, and on Scala Native it can crash the process if that memory has
   *     been returned to the OS;
-  *   - Full: every read throws;
+  *   - Full and Paranoid: every read throws;
   *   - Off: nothing is checked.
   */
 final class NativeChunk private[buffer] (

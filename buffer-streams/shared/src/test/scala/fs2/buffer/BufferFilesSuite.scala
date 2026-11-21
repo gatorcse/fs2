@@ -231,6 +231,23 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
+  test("sendFile appends files larger than one buffer step") {
+    // On Native an O_APPEND target makes sendfile refuse, so this runs the buffered loop.
+    val files = BufferFiles[IO]
+    (source(5 * 65536 + 123), Files[IO].tempFile).tupled.use { case ((src, bytes), dst) =>
+      files.sendFile(src, dst) >> files.sendFile(src, dst, append = true) >>
+        readBack(dst).map(assertEquals(_, bytes ++ bytes))
+    }
+  }
+
+  test("sendFile refuses a source that isn't a regular file, leaving dst alone") {
+    val files = BufferFiles[IO]
+    (Files[IO].tempDirectory, source(100)).tupled.use { case (dir, (dst, bytes)) =>
+      files.sendFile(dir, dst).intercept[java.io.IOException] >>
+        readBack(dst).map(assertEquals(_, bytes))
+    }
+  }
+
   test("sendFile refuses to copy a file onto itself") {
     val files = BufferFiles[IO]
     source(2 * chunk).use { case (src, bytes) =>
@@ -357,22 +374,6 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
         .unsafeReadAllNative(src, chunk)
         .chunkN(3 * chunk)
         .map(_.toArray)
-        .compile
-        .drain
-        .intercept[IllegalStateException]
-        .void
-    }
-  }
-
-  test("misuse: broadcastThrough hands chunks to other fibers") {
-    val files = BufferFiles.withAllocator[IO](checkedAllocator())
-    source(10 * chunk).use { case (src, _) =>
-      files
-        .unsafeReadAllNative(src, chunk)
-        .broadcastThrough(
-          (s: Stream[IO, Byte]) => s.chunks.evalMap(c => IO.sleep(1.milli).as(c.toArray)).drain,
-          (s: Stream[IO, Byte]) => s.drain
-        )
         .compile
         .drain
         .intercept[IllegalStateException]

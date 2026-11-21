@@ -106,16 +106,19 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
     * the JDK's `transferTo`), the download path that needs no buffer. `dst` is truncated
     * unless `append`. Returns the bytes copied.
     *
-    * `src` must be a regular file: the copy runs to the size `src` has when it starts, so a
-    * pipe or device copies nothing. Use [[readAll]] and [[writeAll]] for those. Copying a
-    * file onto itself fails with an `IOException` rather than truncating it.
+    * `src` must be a regular file, since the copy runs to the size it has when it starts: a
+    * directory, pipe or device fails with an `IOException` before `dst` is opened. Use
+    * [[readAll]] and [[writeAll]] for pipes and devices. Copying a file onto itself fails the
+    * same way rather than truncating it.
     */
   def sendFile(src: Path, dst: Path, append: Boolean = false): F[Long] =
     openRead(src)
       .evalTap { in =>
-        F.blocking(in.isSameFile(dst)).flatMap { same =>
-          F.raiseError[Unit](new java.io.IOException(s"sendFile: $src and $dst are the same file"))
-            .whenA(same)
+        F.blocking {
+          if (!in.isRegularFile)
+            throw new java.io.IOException(s"sendFile: $src is not a regular file")
+          if (in.isSameFile(dst))
+            throw new java.io.IOException(s"sendFile: $src and $dst are the same file")
         }
       }
       .product(openWrite(dst, append))
