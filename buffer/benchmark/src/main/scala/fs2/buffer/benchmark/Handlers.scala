@@ -47,9 +47,9 @@ object Handlers {
       Files[IO].readAll(file).through(Files[IO].writeAll(client)).compile.drain
   }
 
-  // ---- native chunks: an ordinary Stream[F, Byte] ----
+  // ---- BufferFiles.readAll: pooled reads copied out to heap chunks ----
 
-  object chunk {
+  object copy {
     private val files = BufferFiles[IO]
 
     def upload(body: Path, dest: Path): IO[Hash] =
@@ -59,6 +59,20 @@ object Handlers {
 
     def download(file: Path, client: Path): IO[Unit] =
       files.readAll(file).through(files.writeAll(client)).compile.drain
+  }
+
+  // ---- native chunks, no copy: still an ordinary Stream[F, Byte] ----
+
+  object chunk {
+    private val files = BufferFiles[IO]
+
+    def upload(body: Path, dest: Path): IO[Hash] =
+      NativeHasher[IO](HashAlgorithm.SHA256).use { h =>
+        files.unsafeReadAllNative(body).through(h.observe(files.writeAll(dest))).compile.lastOrError
+      }
+
+    def download(file: Path, client: Path): IO[Unit] =
+      files.unsafeReadAllNative(file).through(files.writeAll(client)).compile.drain
   }
 
   // ---- no buffer at all ----

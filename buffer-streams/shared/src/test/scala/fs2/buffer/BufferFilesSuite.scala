@@ -66,9 +66,47 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
       val alloc = checkedAllocator()
       val files = BufferFiles.withAllocator[IO](alloc)
       (source(size), Files[IO].tempFile).tupled.use { case ((src, bytes), dst) =>
-        files.readAll(src, chunk).through(files.writeAll(dst)).compile.drain >>
+        files.unsafeReadAllNative(src, chunk).through(files.writeAll(dst)).compile.drain >>
           readBack(dst).map(assertEquals(_, bytes))
       } >> assertDrained(alloc)
+    }
+  }
+
+  test("readAll emits heap chunks, copies files of every size, and drains the pool") {
+    sizes.traverse_ { size =>
+      val alloc = checkedAllocator()
+      val files = BufferFiles.withAllocator[IO](alloc)
+      (source(size), Files[IO].tempFile).tupled.use { case ((src, bytes), dst) =>
+        files
+          .readAll(src, chunk)
+          .chunks
+          .evalTap(c => IO(assert(!c.isInstanceOf[NativeChunk], c.getClass.getName)))
+          .unchunks
+          .through(files.writeAll(dst))
+          .compile
+          .drain >> readBack(dst).map(assertEquals(_, bytes))
+      } >> assertDrained(alloc)
+    }
+  }
+
+  test("readAll's chunks are safe wherever they go, with no lifetime rules") {
+    val files = BufferFiles.withAllocator[IO](checkedAllocator())
+    source(10 * chunk + 1).use { case (src, bytes) =>
+      for {
+        held <- files.readAll(src, chunk).chunks.compile.toList
+        viaPar <- files
+          .readAll(src, chunk)
+          .chunks
+          .parEvalMap(3)(c => IO.sleep(2.millis).as(c))
+          .unchunks
+          .compile
+          .to(Chunk)
+        tail <- files.readAll(src, chunk).chunkN(3 * chunk).compile.toList
+      } yield {
+        assertEquals(Chunk.concat(held), bytes)
+        assertEquals(viaPar, bytes)
+        assertEquals(Chunk.concat(tail), bytes)
+      }
     }
   }
 
@@ -76,7 +114,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     source(3 * chunk).use { case (src, bytes) =>
       files
-        .readAll(src, chunk)
+        .unsafeReadAllNative(src, chunk)
         .chunks
         .map { c =>
           assert(c.isInstanceOf[NativeChunk], c.getClass.getName)
@@ -103,7 +141,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
   test("native chunks flow into fs2-io's own file writer") {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     (source(5 * chunk + 3), Files[IO].tempFile).tupled.use { case ((src, bytes), dst) =>
-      files.readAll(src, chunk).through(Files[IO].writeAll(dst)).compile.drain >>
+      files.unsafeReadAllNative(src, chunk).through(Files[IO].writeAll(dst)).compile.drain >>
         readBack(dst).map(assertEquals(_, bytes))
     }
   }
@@ -116,7 +154,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
         for {
           expected <- Stream.chunk(bytes).through(Hashing[IO].hash(alg)).compile.lastOrError
           viaChunks <- NativeHasher[IO](alg).use { h =>
-            files.readAll(src, chunk).through(h.observe(_.drain)).compile.lastOrError
+            files.unsafeReadAllNative(src, chunk).through(h.observe(_.drain)).compile.lastOrError
           }
           viaHeap <- NativeHasher[IO](alg).use { h =>
             Stream.chunk(bytes).through(h.drain).compile.lastOrError
@@ -180,7 +218,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     (source(10 * chunk + 1), source(7 * chunk)).tupled.use { case ((a, ab), (b, bb)) =>
       for {
         viaPar <- files
-          .readAll(a, chunk)
+          .unsafeReadAllNative(a, chunk)
           .through(NativeChunk.heap)
           .chunks
           .parEvalMap(3)(c => IO.sleep(2.millis).as(c))
@@ -189,7 +227,11 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
           .to(Chunk)
         viaJoin <- Stream(a, b)
           .map(p =>
-            files.readAll(p, chunk).through(NativeChunk.heap).chunks.fold(Chunk.empty[Byte])(_ ++ _)
+            files
+              .unsafeReadAllNative(p, chunk)
+              .through(NativeChunk.heap)
+              .chunks
+              .fold(Chunk.empty[Byte])(_ ++ _)
           )
           .parJoin(2)
           .evalTap(_ => IO.sleep(2.millis))
@@ -208,8 +250,8 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     val files = BufferFiles.withAllocator[IO](checkedAllocator(Checks.Bulk))
     source(10 * chunk + 3).use { case (src, bytes) =>
       for {
-        bv <- files.readAll(src, chunk).compile.to(scodec.bits.ByteVector)
-        bits <- files.readAll(src, chunk).chunks.map(_.toBitVector).compile.toList
+        bv <- files.unsafeReadAllNative(src, chunk).compile.to(scodec.bits.ByteVector)
+        bits <- files.unsafeReadAllNative(src, chunk).chunks.map(_.toBitVector).compile.toList
       } yield {
         assertEquals(bv, bytes.toByteVector)
         assertEquals(bits.reduce(_ ++ _), bytes.toBitVector)
@@ -229,7 +271,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
           during <- IO.ref(0L)
           // Counted straight after the reads, in the same scope: the files must already be
           // closed, not just released when that scope ends.
-          _ <- (Stream.range(0, 50).flatMap(_ => files.readAll(src, chunk)) ++
+          _ <- (Stream.range(0, 50).flatMap(_ => files.unsafeReadAllNative(src, chunk)) ++
             Stream.exec(openFds.flatMap(during.set))).compile.drain
           after <- during.get
         } yield assert(after < before + 10, s"$before fds before, $after during")
@@ -242,7 +284,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     source(10 * chunk).use { case (src, bytes) =>
       // 3 chunks of 4: within the default window of 4.
       files
-        .readAll(src, chunk)
+        .unsafeReadAllNative(src, chunk)
         .chunkN(3 * chunk)
         .map(c => Chunk.array(c.toArray))
         .compile
@@ -255,7 +297,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     source(10 * chunk).use { case (src, _) =>
       files
-        .readAll(src, chunk)
+        .unsafeReadAllNative(src, chunk)
         .chunkN(6 * chunk)
         .map(_.toArray)
         .compile
@@ -274,7 +316,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
       // final partial group, so that group is already released. Without the boundary the
       // same pipeline works (see "a stage holding chunks within the window works").
       files
-        .readAll(src, chunk)
+        .unsafeReadAllNative(src, chunk)
         .chunks
         .unchunks
         .chunkN(3 * chunk)
@@ -290,7 +332,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     source(3 * chunk).use { case (src, _) =>
       for {
-        chunks <- files.readAll(src, chunk).chunks.compile.toList
+        chunks <- files.unsafeReadAllNative(src, chunk).chunks.compile.toList
       } yield {
         assert(chunks.forall(_.asInstanceOf[NativeChunk].isReleased))
         intercept[IllegalStateException](chunks.head.toArray)
@@ -304,7 +346,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     source(10 * chunk).use { case (src, bytes) =>
       for {
         viaChunks <- files
-          .readAll(src, chunk)
+          .unsafeReadAllNative(src, chunk)
           .through(NativeChunk.heap)
           .chunkN(6 * chunk)
           .compile
@@ -318,9 +360,9 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     val files = BufferFiles.withAllocator[IO](alloc)
     source(50 * chunk).use { case (src, _) =>
       List(0, 1, 2, 5).traverse_ { n =>
-        files.readAll(src, chunk).chunks.take(n.toLong).compile.drain >>
+        files.unsafeReadAllNative(src, chunk).chunks.take(n.toLong).compile.drain >>
           files
-            .readAll(src, chunk)
+            .unsafeReadAllNative(src, chunk)
             .evalTap(_ => IO.cede)
             .compile
             .drain

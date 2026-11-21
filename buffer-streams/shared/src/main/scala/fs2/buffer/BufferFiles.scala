@@ -28,29 +28,61 @@ import fs2.io.file.Path
 
 /** Binary file streams over pooled native buffers: the tier-2 sources and sinks.
   *
-  * Each source reads with blocking calls straight into buffers leased from its own
-  * [[Magazine]], so file bytes never touch the heap, and holds only a fixed number of
-  * buffers however large the file. [[readAll]] emits a `Stream[F, Byte]` of
-  * [[NativeChunk]]s, each valid for a rolling window of chunks, and [[writeAll]] writes
-  * them back out without a copy.
+  * Each source reads with blocking calls into buffers leased from its own [[Magazine]],
+  * and holds only a fixed number of buffers however large the file.
+  *
+  *   - [[readAll]] copies each read into an ordinary heap chunk. Its chunks are safe
+  *     anywhere, like fs2-io's.
+  *   - [[unsafeReadAllNative]] emits [[NativeChunk]]s over the pooled memory itself, so
+  *     file bytes never touch the heap, at the price of a lifetime rule the types don't
+  *     enforce. For pipelines that send the bytes straight on, to [[writeAll]], a hasher or
+  *     a socket.
+  *   - [[writeAll]] writes either kind; native chunks go out without a copy.
   *
   * [[sendFile]] copies file to file (or device) inside the kernel, with no buffer at all.
   */
 final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: Sync[F]) {
   import BufferFiles._
 
-  /** Reads `path` as native chunks of up to `chunkSize` bytes: full-size from a regular
-    * file except the last, and whatever has arrived from a pipe or device. Each chunk stays
-    * valid while `window - 1` more are emitted, and the last ones until the scope running
-    * this stream closes; see [[NativeChunk]].
+  /** Reads `path` as heap chunks of up to `chunkSize` bytes: full-size from a regular file
+    * except the last, and whatever has arrived from a pipe or device. Each read goes into a
+    * pooled native buffer and is copied out to a fresh array, so the chunks are ordinary
+    * `Chunk[Byte]`s with no lifetime rules. The file is closed at end of input.
+    */
+  def readAll(path: Path, chunkSize: Int = DefaultChunkSize): Stream[F, Byte] = {
+    require(chunkSize > 0, s"chunkSize must be positive, was $chunkSize")
+    Stream.resource((openRead(path), leaseWindow(1)).tupled).flatMap { case (file, scratch) =>
+      val readChunk: F[Option[Chunk[Byte]]] = F.blocking {
+        val b = scratch.lease(chunkSize)
+        try {
+          val n = file.read(b)
+          if (n < 0) None
+          else {
+            val a = new Array[Byte](n)
+            b.copyToArray(0, a, 0, n)
+            Some(Chunk.array(a))
+          }
+        } finally scratch.discard()
+      }
+      Stream.repeatEval(readChunk).unNoneTerminate.unchunks
+    }
+  }
+
+  /** Reads `path` as native chunks of up to `chunkSize` bytes, with no copy: full-size from
+    * a regular file except the last, and whatever has arrived from a pipe or device.
+    *
+    * '''Unsafe:''' each chunk stays valid only while `window - 1` more are emitted, and the
+    * last ones until the scope running this stream closes. A stage that holds chunks longer,
+    * or hands them to another fiber, must copy them with [[NativeChunk.heap]] first; see
+    * [[NativeChunk]] for the rules. Use [[readAll]] unless the bytes go straight on.
     *
     * The file is closed as soon as it is read to the end. The window's buffers stay with the
     * enclosing scope, so a stream that reads many files one after another, such as
-    * `paths.flatMap(files.readAll(_))`, holds one window per file read so far until that
-    * scope ends. Add `.scope` to each inner stream (`files.readAll(p).scope`) to release each
+    * `paths.flatMap(files.unsafeReadAllNative(_))`, holds one window per file read so far
+    * until that scope ends. Add `.scope` to each inner stream to release each
     * window when its file is done, if nothing downstream holds its chunks past that point.
     */
-  def readAll(
+  def unsafeReadAllNative(
       path: Path,
       chunkSize: Int = DefaultChunkSize,
       window: Int = DefaultWindow
@@ -148,7 +180,7 @@ object BufferFiles {
   /** One 64 KiB size class: large enough for disk throughput, small enough to pool. */
   final val DefaultChunkSize: Int = SizeClass.Bulk
 
-  /** Native chunks kept valid at once by [[BufferFiles.readAll]]. */
+  /** Native chunks kept valid at once by [[BufferFiles.unsafeReadAllNative]]. */
   final val DefaultWindow: Int = 4
 
   /** File streams leasing from [[BufferAllocator.global]]. */
