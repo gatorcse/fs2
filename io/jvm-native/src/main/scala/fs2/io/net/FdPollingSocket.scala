@@ -25,39 +25,39 @@ package io.net
 import cats.effect.{Async, FileDescriptorPollHandle, IO, LiftIO, Resource}
 import cats.effect.std.Mutex
 import com.comcast.ip4s.GenSocketAddress
-import fs2.io.internal.NativeUtil._
-import fs2.io.internal.SocketHelpers
-
-import scala.scalanative.meta.LinktimeInfo
-import scala.scalanative.posix.errno._
-import scala.scalanative.posix.sys.socket._
-import scala.scalanative.posix.unistd
-import scala.scalanative.unsafe._
-import scala.scalanative.unsigned._
+import fs2.io.internal.FdSockets
 
 import FdPollingSocket._
 
+/** A stream socket on a `FileDescriptorPoller`, shared by Scala Native and the JVM (with
+  * `fs2-io-ffm`). Reads and writes are direct system calls on a non-blocking descriptor.
+  */
 private final class FdPollingSocket[F[_]: LiftIO] private (
+    fds: FdSockets,
     fd: Int,
+    domain: Int,
     handle: FileDescriptorPollHandle,
+    gate: FdGate,
     readMutex: Mutex[F],
-    val isOpen: F[Boolean],
+    writeMutex: Mutex[F],
     val address: GenSocketAddress,
     val peerAddress: GenSocketAddress
 )(implicit F: Async[F])
     extends Socket[F] {
 
+  private[this] val sys = fds.sys
+
   def localAddress = F.pure(address.asIpUnsafe)
   def remoteAddress = F.pure(peerAddress.asIpUnsafe)
 
-  def endOfInput: F[Unit] = shutdownF(0)
-  def endOfOutput: F[Unit] = shutdownF(1)
-  private[this] def shutdownF(how: Int): F[Unit] = F.delay {
-    guardMask_(shutdown(fd, how))(_ == ENOTCONN)
-  }
+  def isOpen: F[Boolean] = F.delay(gate.isOpen)
+
+  def endOfInput: F[Unit] = F.delay(gate(fds.shutdown(fd, fds.c.SHUT_RD)))
+  def endOfOutput: F[Unit] = F.delay(gate(fds.shutdown(fd, fds.c.SHUT_WR)))
 
   /** Reads up to `max` bytes in to the current thread's scratch buffer, without waiting for the
-    * file descriptor to become readable. Returns the buffer and the result of `read(2)`.
+    * file descriptor to become readable. Returns the buffer and the result of `read(2)` (-1 if
+    * it would block).
     *
     * The caller must copy the bytes out before it suspends, so that the buffer is never held
     * across a wait and the socket doesn't hold on to a read buffer between reads.
@@ -65,10 +65,14 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
   private def readScratch(max: Int): (Array[Byte], Int) = {
     val buf = scratchBuffer(max)
     val len = math.min(max, MaxScratchSize)
-    (buf, guard(unistd.read(fd, buf.atUnsafe(0), len.toUSize)))
+    (buf, gate(fds.guard(sys.read(fd, buf, 0, len))))
   }
 
-  def read(maxBytes: Int): F[Option[Chunk[Byte]]] = readMutex.lock.surround {
+  def read(maxBytes: Int): F[Option[Chunk[Byte]]] =
+    // a zero-length read(2) would look like end-of-stream
+    if (maxBytes <= 0) F.pure(Some(Chunk.empty)) else read0(maxBytes)
+
+  private[this] def read0(maxBytes: Int): F[Option[Chunk[Byte]]] = readMutex.lock.surround {
     handle
       .pollReadRec(()) { _ =>
         IO {
@@ -84,7 +88,10 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
       .to
   }
 
-  def readN(numBytes: Int): F[Chunk[Byte]] = readMutex.lock.surround {
+  def readN(numBytes: Int): F[Chunk[Byte]] =
+    if (numBytes <= 0) F.pure(Chunk.empty) else readN0(numBytes)
+
+  private[this] def readN0(numBytes: Int): F[Chunk[Byte]] = readMutex.lock.surround {
     // Until the first bytes arrive, reads go to the scratch buffer, so that a socket waiting for
     // data doesn't hold on to an array. After that, `dest` is allocated with size `numBytes` and
     // the rest is read straight in to it.
@@ -97,7 +104,7 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
             System.arraycopy(buf, 0, target, 0, readed)
             (target, readed)
           } else (dest, readed)
-        } else (dest, guard(unistd.read(fd, dest.atUnsafe(pos), (numBytes - pos).toUSize)))
+        } else (dest, gate(fds.guard(sys.read(fd, dest, pos, numBytes - pos))))
       }.flatMap { case (next, readed) =>
         if (readed > 0) {
           val newPos = pos + readed
@@ -121,14 +128,7 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
     val Chunk.ArraySlice(buf, offset, length) = bytes.toArraySlice
 
     def writeNext(pos: Int): IO[Either[Int, Int]] =
-      IO {
-        if (LinktimeInfo.isLinux)
-          guardSSize(
-            send(fd, buf.atUnsafe(offset + pos), (length - pos).toUSize, MSG_NOSIGNAL)
-          ).toInt
-        else
-          guard(unistd.write(fd, buf.atUnsafe(offset + pos), (length - pos).toUSize))
-      }.map { wrote =>
+      IO(gate(fds.guard(sys.write(fd, buf, offset + pos, length - pos)))).map { wrote =>
         if (wrote >= 0)
           Right(wrote)
         else
@@ -147,18 +147,18 @@ private final class FdPollingSocket[F[_]: LiftIO] private (
         }
       }
 
-    writeAll(0).stream
+    // one writer at a time, for the whole chunk, so that concurrent writes don't interleave
+    Stream.resource(writeMutex.lock) >> writeAll(0).stream
   }
 
   def writes: Pipe[F, Byte, Nothing] = _.chunks.foreach(write(_))
 
-  def getOption[A](key: SocketOption.Key[A]) =
-    SocketHelpers.getOption[F, A](fd, key)
+  def getOption[A](key: SocketOption.Key[A]) = F.delay(gate(fds.getOption(fd, domain, key)))
 
   def setOption[A](key: SocketOption.Key[A], value: A) =
-    SocketHelpers.setOption(fd, key, value)
+    F.delay(gate(fds.setOption(fd, domain, key, value)))
 
-  def supportedOptions = SocketHelpers.supportedOptions
+  def supportedOptions = F.pure(fds.supportedOptions(datagram = false, domain))
 }
 
 private object FdPollingSocket {
@@ -175,10 +175,10 @@ private object FdPollingSocket {
     * `MaxScratchSize`. A single read may therefore return fewer than `size` bytes, which callers
     * already allow for.
     *
-    * Scala Native's garbage collectors don't move objects, so `read(2)` can write straight in to
-    * the array, as `write` already relies on for sending.
+    * `read(2)` writes straight in to the array: Scala Native's garbage collectors don't move
+    * objects, and on the JVM the FFM binding pins it for the duration of the call.
     */
-  private def scratchBuffer(size: Int): Array[Byte] = {
+  private[net] def scratchBuffer(size: Int): Array[Byte] = {
     val limit = math.min(size, MaxScratchSize)
     var buffer = scratchBuffers.get()
     if (buffer == null || buffer.length < limit) {
@@ -189,12 +189,25 @@ private object FdPollingSocket {
   }
 
   def apply[F[_]: LiftIO](
+      fds: FdSockets,
       fd: Int,
+      domain: Int,
       handle: FileDescriptorPollHandle,
       address: GenSocketAddress,
       peerAddress: GenSocketAddress
   )(implicit F: Async[F]): Resource[F, Socket[F]] = for {
     readMutex <- Resource.eval(Mutex[F])
-    isOpen <- Resource.make(F.ref(true))(_.set(false))
-  } yield new FdPollingSocket(fd, handle, readMutex, isOpen.get, address, peerAddress)
+    writeMutex <- Resource.eval(Mutex[F])
+    gate <- FdGate.resource[F]
+  } yield new FdPollingSocket(
+    fds,
+    fd,
+    domain,
+    handle,
+    gate,
+    readMutex,
+    writeMutex,
+    address,
+    peerAddress
+  )
 }

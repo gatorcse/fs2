@@ -43,10 +43,6 @@ class IOUdpSuite extends UdpSuite {
   protected override val network = Network[IO]
 }
 
-class AsyncUdpSuite extends UdpSuite {
-  protected override val network = Network.forAsync[IO]
-}
-
 trait UdpSuite extends Fs2Suite with UdpSuitePlatform {
   protected def network: Network[IO]
 

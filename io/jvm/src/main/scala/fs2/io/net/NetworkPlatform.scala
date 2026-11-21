@@ -23,6 +23,7 @@ package fs2
 package io
 package net
 
+import cats.effect.FileDescriptorPoller
 import cats.effect.IO
 import cats.effect.LiftIO
 import cats.effect.Selector
@@ -32,6 +33,7 @@ import com.comcast.ip4s.{Dns, GenSocketAddress}
 
 import fs2.internal.ThreadFactories
 import fs2.io.file.Files
+import fs2.io.internal.{FdSockets, SocketSyscallsLoader}
 
 import java.util.concurrent.ThreadFactory
 
@@ -84,6 +86,28 @@ private[net] trait NetworkCompanionPlatform extends NetworkLowPriority { self: N
       private def tryGetSelector =
         IO.pollers.map(_.collectFirst { case selector: Selector => selector }).to[F]
 
+      /** The poller-based sockets, when the runtime has a `FileDescriptorPoller` (e.g. the
+        * `cats-effect-ffm` polling systems) and `fs2-io-ffm` is on the classpath.
+        */
+      private def tryGetFdSockets: F[Option[FdSockets]] =
+        // the poller first: loading `fs2-io-ffm` binds native functions, which the JDK warns
+        // about unless native access is enabled, so don't load it for a runtime that can't use it
+        IO.pollers
+          .map { ps =>
+            if (ps.exists(_.isInstanceOf[FileDescriptorPoller])) SocketSyscallsLoader.sockets
+            else None
+          }
+          .to[F]
+
+      private def fdPolling[A](
+          ifFdPolling: FdSockets => Resource[F, A],
+          orElse: => Resource[F, A]
+      ): Resource[F, A] =
+        Resource.eval(tryGetFdSockets).flatMap {
+          case Some(fds) => ifFdPolling(fds)
+          case None      => orElse
+        }
+
       private implicit def dnsInstance: Dns[F] = dns
 
       private def selecting[A](
@@ -128,8 +152,17 @@ private[net] trait NetworkCompanionPlatform extends NetworkLowPriority { self: N
       ): Resource[F, Socket[F]] =
         matchAddress(
           address,
-          sa => selecting(_.connectIp(sa, options), fallback.connect(sa, options)),
-          ua => selectingUnix(_.connectUnix(ua, options), fallback.connect(ua, options))
+          sa =>
+            fdPolling(
+              new FdPollingIpSocketsProvider[F](_).connectIp(sa, options),
+              selecting(_.connectIp(sa, options), fallback.connect(sa, options))
+            ),
+          ua =>
+            fdPolling(
+              new FdPollingUnixSocketsProvider[F](_)(Files.forAsync[F], implicitly, implicitly)
+                .connectUnix(ua, options),
+              selectingUnix(_.connectUnix(ua, options), fallback.connect(ua, options))
+            )
         )
 
       override def bind(
@@ -138,8 +171,17 @@ private[net] trait NetworkCompanionPlatform extends NetworkLowPriority { self: N
       ): Resource[F, ServerSocket[F]] =
         matchAddress(
           address,
-          sa => selecting(_.bindIp(sa, options), fallback.bind(sa, options)),
-          ua => selectingUnix(_.bindUnix(ua, options), fallback.bind(ua, options))
+          sa =>
+            fdPolling(
+              new FdPollingIpSocketsProvider[F](_).bindIp(sa, options),
+              selecting(_.bindIp(sa, options), fallback.bind(sa, options))
+            ),
+          ua =>
+            fdPolling(
+              new FdPollingUnixSocketsProvider[F](_)(Files.forAsync[F], implicitly, implicitly)
+                .bindUnix(ua, options),
+              selectingUnix(_.bindUnix(ua, options), fallback.bind(ua, options))
+            )
         )
 
       override def bindDatagramSocket(
@@ -149,9 +191,12 @@ private[net] trait NetworkCompanionPlatform extends NetworkLowPriority { self: N
         matchAddress(
           address,
           sa =>
-            selectingDatagram(
-              _.bindDatagramSocket(sa, options),
-              fallback.bindDatagramSocket(sa, options)
+            fdPolling(
+              new FdPollingIpDatagramSocketsProvider[F](_).bindDatagramSocket(sa, options),
+              selectingDatagram(
+                _.bindDatagramSocket(sa, options),
+                fallback.bindDatagramSocket(sa, options)
+              )
             ),
           ua => fallback.bindDatagramSocket(ua, options)
         )

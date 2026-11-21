@@ -25,5 +25,8 @@ package io.net
 import cats.effect.IO
 
 trait UnixSocketsSuitePlatform { self: UnixSocketsSuite =>
-  testProvider("native", new FdPollingUnixSocketsProvider[IO])
+  testProvider(
+    "native",
+    new FdPollingUnixSocketsProvider[IO](fs2.io.internal.NativeSocketSyscalls.sockets)
+  )
 }

@@ -60,10 +60,6 @@ jobs:
           java-version: 17
           cache: sbt
 
-      - name: sbt update
-        if: matrix.java == 'temurin@17' && steps.setup-java-temurin-17.outputs.cache-hit == 'false'
-        run: sbt +update
-
       - name: Setup Java (temurin@21)
         id: setup-java-temurin-21
         if: matrix.java == 'temurin@21'
@@ -73,13 +69,23 @@ jobs:
           java-version: 21
           cache: sbt
 
-      - name: sbt update
-        if: matrix.java == 'temurin@21' && steps.setup-java-temurin-21.outputs.cache-hit == 'false'
-        run: sbt +update
-
       - name: Install brew formulae (ubuntu)
         if: (matrix.project == 'rootNative') && startsWith(matrix.os, 'ubuntu')
         run: /home/linuxbrew/.linuxbrew/bin/brew install openssl s2n
+
+      - name: Publish the cats-effect fork locally (JVM)
+        if: matrix.project == 'rootJVM'
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ ${{ matrix.scala }}' kernelJVM/publishLocal kernelTestkitJVM/publishLocal lawsJVM/publishLocal coreJVM/publishLocal stdJVM/publishLocal testkitJVM/publishLocal
+
+      - name: Publish the cats-effect fork locally (Native)
+        if: matrix.project == 'rootNative'
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ ${{ matrix.scala }}' kernelNative/publishLocal kernelTestkitNative/publishLocal lawsNative/publishLocal coreNative/publishLocal stdNative/publishLocal testkitNative/publishLocal
 
       - name: Check that workflows are up to date
         run: sbt githubWorkflowCheck
@@ -115,11 +121,11 @@ jobs:
 
       - name: Make target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: mkdir -p buffer-streams/native/target buffer/jvm/target protocols/js/target io/native/target unidocs/target core/native/target buffer-streams/jvm/target core/js/target buffer/native/target protocols/native/target core/jvm/target scodec/jvm/target scodec/js/target io/js/target reactive-streams/target io/jvm/target protocols/jvm/target scodec/native/target project/target
+        run: mkdir -p buffer-streams/native/target buffer/jvm/target protocols/js/target io/native/target unidocs/target core/native/target io-ffm/target buffer-streams/jvm/target core/js/target buffer/native/target protocols/native/target core/jvm/target scodec/jvm/target scodec/js/target io/js/target reactive-streams/target io/jvm/target protocols/jvm/target scodec/native/target project/target
 
       - name: Compress target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: tar cf targets.tar buffer-streams/native/target buffer/jvm/target protocols/js/target io/native/target unidocs/target core/native/target buffer-streams/jvm/target core/js/target buffer/native/target protocols/native/target core/jvm/target scodec/jvm/target scodec/js/target io/js/target reactive-streams/target io/jvm/target protocols/jvm/target scodec/native/target project/target
+        run: tar cf targets.tar buffer-streams/native/target buffer/jvm/target protocols/js/target io/native/target unidocs/target core/native/target io-ffm/target buffer-streams/jvm/target core/js/target buffer/native/target protocols/native/target core/jvm/target scodec/jvm/target scodec/js/target io/js/target reactive-streams/target io/jvm/target protocols/jvm/target scodec/native/target project/target
 
       - name: Upload target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
@@ -155,10 +161,6 @@ jobs:
           java-version: 17
           cache: sbt
 
-      - name: sbt update
-        if: matrix.java == 'temurin@17' && steps.setup-java-temurin-17.outputs.cache-hit == 'false'
-        run: sbt +update
-
       - name: Setup Java (temurin@21)
         id: setup-java-temurin-21
         if: matrix.java == 'temurin@21'
@@ -167,10 +169,6 @@ jobs:
           distribution: temurin
           java-version: 21
           cache: sbt
-
-      - name: sbt update
-        if: matrix.java == 'temurin@21' && steps.setup-java-temurin-21.outputs.cache-hit == 'false'
-        run: sbt +update
 
       - name: Download target directories (2.12, rootJS)
         uses: actions/download-artifact@v6
@@ -286,55 +284,6 @@ jobs:
           SONATYPE_CREDENTIAL_HOST: ${{ secrets.SONATYPE_CREDENTIAL_HOST }}
         run: sbt tlCiRelease
 
-  dependency-submission:
-    name: Submit Dependencies
-    if: github.event.repository.fork == false && github.event_name != 'pull_request'
-    strategy:
-      matrix:
-        os: [ubuntu-22.04]
-        java: [temurin@17]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout current branch (full)
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup sbt
-        uses: sbt/setup-sbt@v1
-
-      - name: Setup Java (temurin@17)
-        id: setup-java-temurin-17
-        if: matrix.java == 'temurin@17'
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 17
-          cache: sbt
-
-      - name: sbt update
-        if: matrix.java == 'temurin@17' && steps.setup-java-temurin-17.outputs.cache-hit == 'false'
-        run: sbt +update
-
-      - name: Setup Java (temurin@21)
-        id: setup-java-temurin-21
-        if: matrix.java == 'temurin@21'
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 21
-          cache: sbt
-
-      - name: sbt update
-        if: matrix.java == 'temurin@21' && steps.setup-java-temurin-21.outputs.cache-hit == 'false'
-        run: sbt +update
-
-      - name: Submit Dependencies
-        uses: scalacenter/sbt-dependency-submission@v2
-        with:
-          modules-ignore: integration_2.12 integration_2.13 integration_3 rootjs_2.12 rootjs_2.13 rootjs_3 microsite_2.12 microsite_2.13 microsite_3 rootjvm_2.12 rootjvm_2.13 rootjvm_3 rootnative_2.12 rootnative_2.13 rootnative_3 fs2-buffer-benchmark_2.12 fs2-buffer-benchmark_2.13 fs2-buffer-benchmark_3 fs2-benchmark_2.12 fs2-benchmark_2.13 fs2-benchmark_3
-          configs-ignore: test scala-tool scala-doc-tool test-internal
-
   macos:
     name: Test I/O on macOS
     strategy:
@@ -361,10 +310,6 @@ jobs:
           java-version: 17
           cache: sbt
 
-      - name: sbt update
-        if: matrix.java == 'temurin@17' && steps.setup-java-temurin-17.outputs.cache-hit == 'false'
-        run: sbt +update
-
       - name: Setup Java (temurin@21)
         id: setup-java-temurin-21
         if: matrix.java == 'temurin@21'
@@ -374,9 +319,19 @@ jobs:
           java-version: 21
           cache: sbt
 
-      - name: sbt update
-        if: matrix.java == 'temurin@21' && steps.setup-java-temurin-21.outputs.cache-hit == 'false'
-        run: sbt +update
+      - name: Publish the cats-effect fork locally (JVM)
+        if: matrix.project == 'ioJVM'
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ 2.13' kernelJVM/publishLocal kernelTestkitJVM/publishLocal lawsJVM/publishLocal coreJVM/publishLocal stdJVM/publishLocal testkitJVM/publishLocal
+
+      - name: Publish the cats-effect fork locally (Native)
+        if: matrix.project == 'ioNative'
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ 2.13' kernelNative/publishLocal kernelTestkitNative/publishLocal lawsNative/publishLocal coreNative/publishLocal stdNative/publishLocal testkitNative/publishLocal
 
       - if: matrix.project == 'ioNative'
         run: brew install s2n
@@ -406,8 +361,53 @@ jobs:
           java-version: 25
           cache: sbt
 
+      - name: Publish the cats-effect fork locally (JVM)
+        if: endsWith(matrix.project, 'JVM')
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ ${{ matrix.scala }}' kernelJVM/publishLocal kernelTestkitJVM/publishLocal lawsJVM/publishLocal coreJVM/publishLocal stdJVM/publishLocal testkitJVM/publishLocal
+
+      - name: Publish the cats-effect fork locally (Native)
+        if: endsWith(matrix.project, 'Native')
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ ${{ matrix.scala }}' kernelNative/publishLocal kernelTestkitNative/publishLocal lawsNative/publishLocal coreNative/publishLocal stdNative/publishLocal testkitNative/publishLocal
+
       - name: Test
         run: sbt '++ ${{ matrix.scala }}' '${{ matrix.project }}/test' '${{ matrix.project }}/headerCheckAll' '${{ matrix.project }}/scalafmtCheckAll'
+
+  io-ffm:
+    name: Test fs2-io-ffm (JDK 25)
+    strategy:
+      matrix:
+        os: [ubuntu-22.04]
+        java: [temurin@25]
+        scala: [2.12, 2.13, 3]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout current branch (fast)
+        uses: actions/checkout@v6
+
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Setup Java (temurin@25)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: sbt
+
+      - name: Publish the cats-effect fork locally (JVM, ffm)
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ ${{ matrix.scala }}' kernelJVM/publishLocal kernelTestkitJVM/publishLocal lawsJVM/publishLocal coreJVM/publishLocal stdJVM/publishLocal testkitJVM/publishLocal ffm/publishLocal
+
+      - name: Test
+        run: sbt '++ ${{ matrix.scala }}' ioFfm/test ioFfm/headerCheckAll ioFfm/scalafmtCheckAll
 
   site:
     name: Generate Site
@@ -434,10 +434,6 @@ jobs:
           java-version: 17
           cache: sbt
 
-      - name: sbt update
-        if: matrix.java == 'temurin@17' && steps.setup-java-temurin-17.outputs.cache-hit == 'false'
-        run: sbt +update
-
       - name: Setup Java (temurin@21)
         id: setup-java-temurin-21
         if: matrix.java == 'temurin@21'
@@ -447,9 +443,11 @@ jobs:
           java-version: 21
           cache: sbt
 
-      - name: sbt update
-        if: matrix.java == 'temurin@21' && steps.setup-java-temurin-21.outputs.cache-hit == 'false'
-        run: sbt +update
+      - name: Publish the cats-effect fork locally (JVM)
+        run: |
+          git clone --filter=blob:none https://github.com/gatorcse/cats-effect.git /tmp/cats-effect-fork
+          cd /tmp/cats-effect-fork && git checkout f4ffbe57c7c2e6ddad6a164991b1083aaf13deab
+          cd /tmp/cats-effect-fork && sbt 'set ThisBuild / version := "3.8-ffm-SNAPSHOT"' 'set ThisBuild / Compile / packageDoc / publishArtifact := false' '++ 2.13' kernelJVM/publishLocal kernelTestkitJVM/publishLocal lawsJVM/publishLocal coreJVM/publishLocal stdJVM/publishLocal testkitJVM/publishLocal
 
       - name: Generate site
         run: sbt microsite/tlSite

@@ -13,6 +13,18 @@ ThisBuild / startYear := Some(2013)
 
 val Scala213 = "2.13.18"
 
+// The FileDescriptorPoller sockets need cats-effect's polling work (FileDescriptorPoller in
+// jvm-native, cats-effect-ffm), which isn't released yet: build it from the cats-effect fork and
+// `publishLocal` it as this version (CI does so, see `catsEffectForkSteps`). Scala.js keeps the
+// released cats-effect.
+val catsEffectFork = sys.env.getOrElse("FS2_CATS_EFFECT_VERSION", "3.8-ffm-SNAPSHOT")
+val catsEffectForkRepo = "https://github.com/gatorcse/cats-effect.git"
+val catsEffectForkRef =
+  sys.env.getOrElse("FS2_CATS_EFFECT_REF", "f4ffbe57c7c2e6ddad6a164991b1083aaf13deab")
+lazy val ceVersion = Def.setting {
+  if (crossProjectPlatform.value == JSPlatform) "3.7.1" else catsEffectFork
+}
+
 ThisBuild / scalaVersion := Scala213
 ThisBuild / crossScalaVersions := Seq("2.12.21", Scala213, "3.3.9")
 ThisBuild / tlVersionIntroduced := Map("3" -> "3.0.3")
@@ -30,6 +42,46 @@ ThisBuild / githubWorkflowBuild ++= Seq(
   )
 )
 
+// Builds the cats-effect fork that fs2's JVM and Native modules depend on (see `catsEffectFork`)
+// and publishes it locally, for `scala` and the modules `targets` (e.g. "JVM", "Native", "ffm").
+def catsEffectForkSteps(scala: String, targets: List[String], cond: Option[String]) = {
+  val modules = List("kernel", "kernelTestkit", "laws", "core", "std", "testkit")
+  val publish = targets.flatMap {
+    case "ffm"    => List("ffm/publishLocal")
+    case platform => modules.map(m => s"$m$platform/publishLocal")
+  }
+  List(
+    WorkflowStep.Run(
+      List(
+        s"git clone --filter=blob:none $catsEffectForkRepo /tmp/cats-effect-fork",
+        s"cd /tmp/cats-effect-fork && git checkout $catsEffectForkRef",
+        "cd /tmp/cats-effect-fork && sbt " +
+          (List(
+            s"""'set ThisBuild / version := "$catsEffectFork"'""",
+            "'set ThisBuild / Compile / packageDoc / publishArtifact := false'",
+            s"'++ $scala'"
+          ) ++ publish).mkString(" ")
+      ),
+      name = Some(s"Publish the cats-effect fork locally (${targets.mkString(", ")})"),
+      cond = cond
+    )
+  )
+}
+
+// the dependency graph resolves fs2's dependencies too (the site job publishes the fork itself)
+ThisBuild / tlCiDependencyGraphJob := false
+
+// `sbt +update` would run before the cats-effect fork is published
+ThisBuild / githubWorkflowJobSetup ~= (_.filterNot(_.name.exists(_.startsWith("sbt update"))))
+
+ThisBuild / githubWorkflowBuildPreamble ++=
+  catsEffectForkSteps("${{ matrix.scala }}", List("JVM"), Some("matrix.project == 'rootJVM'")) ++
+    catsEffectForkSteps(
+      "${{ matrix.scala }}",
+      List("Native"),
+      Some("matrix.project == 'rootNative'")
+    )
+
 ThisBuild / githubWorkflowAddedJobs +=
   WorkflowJob(
     "macos",
@@ -39,11 +91,13 @@ ThisBuild / githubWorkflowAddedJobs +=
     javas = List(githubWorkflowJavaVersions.value.head),
     oses = List("macos-15"),
     matrixAdds = Map("project" -> List("ioJS", "ioJVM", "ioNative")),
-    steps = githubWorkflowJobSetup.value.toList ++ List(
-      WorkflowStep.Run(List("brew install s2n"), cond = Some("matrix.project == 'ioNative'")),
-      // macOS 15+ runners block sending multicast to the local network - https://github.com/actions/runner-images/issues/10924
-      WorkflowStep.Sbt(List("${{ matrix.project }}/testOnly -- --exclude-tags=Multicast"))
-    )
+    steps = githubWorkflowJobSetup.value.toList ++
+      catsEffectForkSteps("2.13", List("JVM"), Some("matrix.project == 'ioJVM'")) ++
+      catsEffectForkSteps("2.13", List("Native"), Some("matrix.project == 'ioNative'")) ++ List(
+        WorkflowStep.Run(List("brew install s2n"), cond = Some("matrix.project == 'ioNative'")),
+        // macOS 15+ runners block sending multicast to the local network - https://github.com/actions/runner-images/issues/10924
+        WorkflowStep.Sbt(List("${{ matrix.project }}/testOnly -- --exclude-tags=Multicast"))
+      )
   )
 
 ThisBuild / githubWorkflowPublishNeeds += "macos"
@@ -66,13 +120,52 @@ ThisBuild / githubWorkflowAddedJobs +=
         UseRef.Public("actions", "setup-java", "v5"),
         name = Some("Setup Java (temurin@25)"),
         params = Map("distribution" -> "temurin", "java-version" -> "25", "cache" -> "sbt")
-      ),
+      )
+    ) ++ catsEffectForkSteps(
+      "${{ matrix.scala }}",
+      List("JVM"),
+      Some("endsWith(matrix.project, 'JVM')")
+    ) ++ catsEffectForkSteps(
+      "${{ matrix.scala }}",
+      List("Native"),
+      Some("endsWith(matrix.project, 'Native')")
+    ) ++ List(
       WorkflowStep.Sbt(
         List(
           "++ ${{ matrix.scala }}",
           "${{ matrix.project }}/test",
           "${{ matrix.project }}/headerCheckAll",
           "${{ matrix.project }}/scalafmtCheckAll"
+        ),
+        name = Some("Test")
+      )
+    )
+  )
+
+ThisBuild / githubWorkflowAddedJobs +=
+  WorkflowJob(
+    "io-ffm",
+    "Test fs2-io-ffm (JDK 25)",
+    scalas = Nil,
+    sbtStepPreamble = Nil,
+    javas = List(JavaSpec.temurin("25")),
+    // Linux only until cats-effect-ffm has a kqueue polling system
+    matrixAdds = Map("scala" -> List("2.12", "2.13", "3")),
+    steps = List(
+      WorkflowStep.Checkout,
+      WorkflowStep.Use(UseRef.Public("sbt", "setup-sbt", "v1"), name = Some("Setup sbt")),
+      WorkflowStep.Use(
+        UseRef.Public("actions", "setup-java", "v5"),
+        name = Some("Setup Java (temurin@25)"),
+        params = Map("distribution" -> "temurin", "java-version" -> "25", "cache" -> "sbt")
+      )
+    ) ++ catsEffectForkSteps("${{ matrix.scala }}", List("JVM", "ffm"), None) ++ List(
+      WorkflowStep.Sbt(
+        List(
+          "++ ${{ matrix.scala }}",
+          "ioFfm/test",
+          "ioFfm/headerCheckAll",
+          "ioFfm/scalafmtCheckAll"
         ),
         name = Some("Test")
       )
@@ -356,6 +449,10 @@ ThisBuild / mimaBinaryIssueFilters ++= Seq(
   ProblemFilters.exclude[IncompatibleMethTypeProblem]("fs2.io.net.FdPollingSocket.apply"),
   ProblemFilters.exclude[MissingClassProblem]("fs2.io.net.FdPollingSocketGroup"),
   ProblemFilters.exclude[MissingClassProblem]("fs2.io.net.unixsocket.FdPollingUnixSockets"),
+  // private poller-based socket classes, now shared by the JVM and Native over SocketSyscalls
+  ProblemFilters.exclude[Problem]("fs2.io.net.FdPolling*"),
+  // private
+  ProblemFilters.exclude[Problem]("fs2.io.net.tls.S2nConnection#SendCallbackContext*"),
   ProblemFilters.exclude[IncompatibleResultTypeProblem](
     "fs2.io.net.AsynchronousDatagramSocketGroup#WriterDatagram.remote"
   ),
@@ -467,10 +564,10 @@ lazy val core = crossProject(JVMPlatform, JSPlatform, NativePlatform)
     libraryDependencies ++= Seq(
       "org.scodec" %%% "scodec-bits" % "1.2.5",
       "org.typelevel" %%% "cats-core" % "2.13.0",
-      "org.typelevel" %%% "cats-effect" % "3.7.1",
+      "org.typelevel" %%% "cats-effect" % ceVersion.value,
       "org.typelevel" %%% "cats-mtl" % "1.7.0",
-      "org.typelevel" %%% "cats-effect-laws" % "3.7.1" % Test,
-      "org.typelevel" %%% "cats-effect-testkit" % "3.7.1" % Test,
+      "org.typelevel" %%% "cats-effect-laws" % ceVersion.value % Test,
+      "org.typelevel" %%% "cats-effect-testkit" % ceVersion.value % Test,
       "org.typelevel" %%% "cats-laws" % "2.13.0" % Test,
       "org.typelevel" %%% "cats-mtl-laws" % "1.7.0" % Test,
       "org.typelevel" %%% "discipline-munit" % "2.0.0" % Test,
@@ -607,9 +704,9 @@ lazy val buffer = crossProject(JVMPlatform, NativePlatform)
     tlVersionIntroduced := List("2.12", "2.13", "3").map(_ -> "3.16.0").toMap,
     mimaPreviousArtifacts := Set.empty,
     libraryDependencies ++= Seq(
-      "org.typelevel" %%% "cats-effect-kernel" % "3.7.1",
-      "org.typelevel" %%% "cats-effect" % "3.7.1" % Test,
-      "org.typelevel" %%% "cats-effect-testkit" % "3.7.1" % Test,
+      "org.typelevel" %%% "cats-effect-kernel" % ceVersion.value,
+      "org.typelevel" %%% "cats-effect" % ceVersion.value % Test,
+      "org.typelevel" %%% "cats-effect-testkit" % ceVersion.value % Test,
       "org.typelevel" %%% "munit-cats-effect" % "2.2.1" % Test,
       "org.scalameta" %%% "munit-scalacheck" % "1.2.0" % Test
     )
@@ -634,7 +731,7 @@ lazy val bufferStreams = crossProject(JVMPlatform, NativePlatform)
     tlVersionIntroduced := List("2.12", "2.13", "3").map(_ -> "3.16.0").toMap,
     mimaPreviousArtifacts := Set.empty,
     libraryDependencies ++= Seq(
-      "org.typelevel" %%% "cats-effect-testkit" % "3.7.1" % Test,
+      "org.typelevel" %%% "cats-effect-testkit" % ceVersion.value % Test,
       "org.typelevel" %%% "munit-cats-effect" % "2.2.1" % Test
     )
   )
@@ -645,6 +742,37 @@ lazy val bufferStreams = crossProject(JVMPlatform, NativePlatform)
 
 lazy val bufferStreamsJVM = bufferStreams.jvm
 lazy val bufferStreamsNative = bufferStreams.native
+
+// fs2 sockets on cats-effect's FileDescriptorPoller for the JVM: the socket system calls through
+// the Foreign Function & Memory API (JDK 25+). The socket logic itself is shared with Scala Native
+// in io/jvm-native. Not aggregated into `root`, so the main CI matrix (JDK 17 and 21) is
+// unaffected; the `io-ffm` workflow job builds it on JDK 25.
+lazy val ioFfm = project
+  .in(file("io-ffm"))
+  .dependsOn(io.jvm % "compile->compile;test->test")
+  .settings(
+    name := "fs2-io-ffm",
+    tlVersionIntroduced := List("2.12", "2.13", "3").map(_ -> "3.16.0").toMap,
+    mimaPreviousArtifacts := Set.empty,
+    tlJdkRelease := Some(25),
+    libraryDependencies ++= Seq(
+      "org.typelevel" %% "cats-effect-ffm" % catsEffectFork,
+      // fs2-io's UnixSocketsSuite also covers the JNR provider
+      "com.github.jnr" % "jnr-unixsocket" % "0.39.9" % Test
+    ),
+    // the FFM bindings are restricted methods by design; JDK 25 javac warns on every one
+    javacOptions += "-Xlint:-restricted",
+    Test / fork := true,
+    Test / javaOptions ++= Seq(
+      "--enable-native-access=ALL-UNNAMED",
+      "-Dcats.effect.ffm.quiet=true"
+    ),
+    // Scala 2.12's API extraction crashes on suites that extend fs2-io's test classes
+    // ("cannot find A in applied type"), so the suites run on 2.13 and 3 only
+    Test / unmanagedSources := {
+      if (scalaBinaryVersion.value == "2.12") Nil else (Test / unmanagedSources).value
+    }
+  )
 
 lazy val bufferBenchmark = project
   .in(file("buffer/benchmark"))
@@ -742,7 +870,8 @@ lazy val microsite = project
     },
     tlJdkRelease := None,
     tlFatalWarnings := false,
-    tlSiteApiPackage := Some("fs2")
+    tlSiteApiPackage := Some("fs2"),
+    tlSiteGenerate := catsEffectForkSteps("2.13", List("JVM"), None) ++ tlSiteGenerate.value
   )
   .dependsOn(coreJVM, io.jvm, reactiveStreams, scodec.jvm)
   .enablePlugins(TypelevelSitePlugin)

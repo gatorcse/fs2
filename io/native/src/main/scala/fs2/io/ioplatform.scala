@@ -23,7 +23,6 @@ package fs2
 package io
 
 import cats.Show
-import cats.effect.FileDescriptorPoller
 import cats.effect.IO
 import cats.effect.LiftIO
 import cats.effect.kernel.Async
@@ -44,15 +43,6 @@ private[fs2] trait ioplatform extends iojvmnative {
 
   private[io] val PathStreamChunkSize =
     16
-
-  private[fs2] def fileDescriptorPoller[F[_]: LiftIO]: F[FileDescriptorPoller] =
-    IO.pollers
-      .flatMap(
-        _.collectFirst { case poller: FileDescriptorPoller => poller }.liftTo[IO](
-          new RuntimeException("Installed PollingSystem does not provide a FileDescriptorPoller")
-        )
-      )
-      .to
 
   //
   // STDIN/STDOUT Helpers
