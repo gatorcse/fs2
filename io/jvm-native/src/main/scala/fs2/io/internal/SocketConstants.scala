@@ -37,7 +37,7 @@ private[fs2] final class SocketConstants private (
     val AF_INET6: Int,
     val SOCK_STREAM: Int,
     val SOCK_DGRAM: Int,
-    /** `SOCK_NONBLOCK | SOCK_CLOEXEC` for `socket` and `accept4`, or 0 where the OS lacks them. */
+    // `SOCK_NONBLOCK | SOCK_CLOEXEC` for `socket` and `accept4`, or 0 where the OS lacks them.
     val SOCK_NONBLOCK_CLOEXEC: Int,
     // fcntl
     val F_SETFD: Int,
@@ -59,13 +59,13 @@ private[fs2] final class SocketConstants private (
     val SO_REUSEPORT: Int,
     val SO_KEEPALIVE: Int,
     val SO_BROADCAST: Int,
-    /** `SO_LINGER` in seconds (`SO_LINGER_SEC` on macOS, whose `SO_LINGER` counts ticks). */
+    // `SO_LINGER` in seconds (`SO_LINGER_SEC` on macOS, whose `SO_LINGER` counts ticks).
     val SO_LINGER: Int,
     val SO_SNDBUF: Int,
     val SO_RCVBUF: Int,
     val SO_ERROR: Int,
     val SO_TYPE: Int,
-    /** macOS only; -1 elsewhere. */
+    // macOS only; -1 elsewhere.
     val SO_NOSIGPIPE: Int,
     // IPPROTO_TCP
     val TCP_NODELAY: Int,
@@ -74,7 +74,7 @@ private[fs2] final class SocketConstants private (
     val IP_MULTICAST_IF: Int,
     val IP_MULTICAST_TTL: Int,
     val IP_MULTICAST_LOOP: Int,
-    /** Linux netfilter only; -1 elsewhere. */
+    // Linux netfilter only; -1 elsewhere.
     val SO_ORIGINAL_DST: Int,
     // IPPROTO_IPV6
     val IPV6_TCLASS: Int,
@@ -106,11 +106,11 @@ private[fs2] final class SocketConstants private (
     val ENETUNREACH: Int,
     val EHOSTUNREACH: Int,
     // struct layouts
-    /** BSD `sockaddr`s start with a one-byte length, and the family is one byte. */
+    // BSD `sockaddr`s start with a one-byte length, and the family is one byte.
     val sockaddrHasLen: Boolean,
-    /** `sizeof(((struct sockaddr_un *)0)->sun_path)`. */
+    // `sizeof(((struct sockaddr_un *)0)->sun_path)`.
     val sunPathSize: Int,
-    /** Offset of `gr_group` in `struct group_req` (and `gsr_group` in `group_source_req`). */
+    // Offset of `gr_group` in `struct group_req` (and `gsr_group` in `group_source_req`).
     val groupReqAddrOffset: Int
 ) {
   val SockaddrStorageSize = 128
@@ -120,13 +120,13 @@ private[fs2] final class SocketConstants private (
   val GroupReqSize = groupReqAddrOffset + SockaddrStorageSize
   val GroupSourceReqSize = groupReqAddrOffset + 2 * SockaddrStorageSize
 
-  /** `EWOULDBLOCK` is `EAGAIN` on both Linux and macOS. */
+  // `EWOULDBLOCK` is `EAGAIN` on both Linux and macOS.
   def wouldBlock(errno: Int): Boolean = errno == EAGAIN
 }
 
 private[fs2] object SocketConstants {
 
-  /** Linux, generic ABI (x86_64, aarch64, riscv64; not MIPS, SPARC, PowerPC or Alpha). */
+  // Linux, generic ABI (x86_64, aarch64, riscv64; not MIPS, SPARC, PowerPC or Alpha).
   val Linux: SocketConstants = new SocketConstants(
     isLinux = true,
     isMac = false,
@@ -198,7 +198,7 @@ private[fs2] object SocketConstants {
     groupReqAddrOffset = 8
   )
 
-  /** macOS (Darwin), arm64 and x86_64. */
+  // macOS (Darwin), arm64 and x86_64.
   val Darwin: SocketConstants = new SocketConstants(
     isLinux = false,
     isMac = true,
