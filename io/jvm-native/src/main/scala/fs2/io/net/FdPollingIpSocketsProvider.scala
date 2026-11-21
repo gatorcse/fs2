@@ -23,6 +23,7 @@ package fs2
 package io
 package net
 
+import cats.effect.FileDescriptorPollHandle
 import cats.effect.IO
 import cats.effect.LiftIO
 import cats.effect.kernel.Async
@@ -31,7 +32,9 @@ import cats.syntax.all._
 import com.comcast.ip4s._
 import fs2.io.internal.FdSockets
 
-import FdPollingIpSocketsProvider.SoMaxConn
+import java.util.concurrent.atomic.AtomicInteger
+
+import FdPollingIpSocketsProvider.{SoMaxConn, accepted}
 
 private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets)(implicit
     F: Async[F]
@@ -90,19 +93,7 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
       .resource {
         // errors (e.g. out of descriptors, or an unsupported option) end the stream, like NIO's;
         // only a client that has already gone is dropped
-        Resource
-          .makeFull[F, Int] { poll =>
-            poll {
-              handle
-                .pollReadRec(()) { _ =>
-                  IO {
-                    val clientFd = serverGate(fds.accept(fd))
-                    if (clientFd >= 0) Right(clientFd) else Left(())
-                  }
-                }
-                .to
-            }
-          }(clientFd => F.delay(fds.close(clientFd)))
+        accepted[F](fds, fd, handle, serverGate)
           .flatMap { clientFd =>
             val connected = F.delay(Option(fds.peerAddressIfConnected(clientFd))).flatMap {
               case None       => F.pure(Option.empty[GenSocketAddress])
@@ -143,4 +134,37 @@ private object FdPollingIpSocketsProvider {
 
   /** `SOMAXCONN`; the kernel clamps larger values to its own limit. */
   private[net] final val SoMaxConn = 4096
+
+  /** The next connection accepted on the listening socket `fd`, closed when released. */
+  private[net] def accepted[F[_]: LiftIO](
+      fds: FdSockets,
+      fd: Int,
+      handle: FileDescriptorPollHandle,
+      serverGate: FdGate
+  )(implicit F: Async[F]): Resource[F, Int] =
+    Resource.makeFull[F, Int] { poll =>
+      F.delay(new AtomicInteger(-1)).flatMap { taken =>
+        val accept = poll {
+          handle
+            .pollReadRec(()) { _ =>
+              IO {
+                val clientFd = serverGate(fds.accept(fd))
+                if (clientFd >= 0) {
+                  taken.set(clientFd)
+                  Right(clientFd)
+                } else Left(())
+              }
+            }
+            .to
+        }
+        // canceled after accept(2) but before the resource took ownership of the descriptor
+        F.onCancel(
+          accept,
+          F.delay {
+            val clientFd = taken.getAndSet(-1)
+            if (clientFd >= 0) fds.close(clientFd)
+          }
+        )
+      }
+    }(clientFd => F.delay(fds.close(clientFd)))
 }

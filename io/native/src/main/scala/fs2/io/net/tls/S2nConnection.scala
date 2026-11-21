@@ -24,6 +24,7 @@ package io.net
 package tls
 
 import cats.effect.kernel.Async
+import cats.effect.kernel.Outcome
 import cats.effect.kernel.Resource
 import cats.effect.syntax.all._
 import cats.syntax.all._
@@ -105,10 +106,11 @@ private[tls] object S2nConnection {
       }
 
       sendAvailable <- F.delay(new AtomicBoolean(true)).toResource
+      sendBroken <- F.delay(new AtomicBoolean(false)).toResource
       writeTasks <- F.delay(new AtomicReference[F[Unit]](F.unit)).toResource
       _ <- Resource.eval {
         F.delay {
-          val ctx = SendCallbackContext(sendAvailable, writeTasks, socket, F)
+          val ctx = SendCallbackContext(sendAvailable, sendBroken, writeTasks, socket, F)
           guard_(s2n_connection_set_send_ctx(conn, toPtr_(ctx)))
           guard_(s2n_connection_set_send_cb(conn, sendCallback[F](_, _, _)))
           gcRoot.add(ctx)
@@ -281,6 +283,7 @@ private[tls] object S2nConnection {
 
   private final case class SendCallbackContext[F[_]](
       sendAvailable: AtomicBoolean,
+      sendBroken: AtomicBoolean,
       writeTasks: AtomicReference[F[Unit]],
       socket: Socket[F],
       async: Async[F]
@@ -291,10 +294,19 @@ private[tls] object S2nConnection {
     import ctx._
     implicit val F = async
 
-    if (sendAvailable.getAndSet(false)) {
+    if (sendBroken.get()) {
+      // An earlier write failed or was canceled, so its bytes may be lost: fail rather than
+      // report EWOULDBLOCK, which would leave s2n (e.g. a shutdown) waiting forever.
+      libc.errno.errno = posix.errno.EPIPE
+      S2N_FAILURE
+    } else if (sendAvailable.getAndSet(false)) {
       val writeTask =
-        socket.write(Chunk.byteVector(ByteVector.fromPtr(buf, len.toLong))) *>
-          F.delay(sendAvailable.set(true))
+        socket
+          .write(Chunk.byteVector(ByteVector.fromPtr(buf, len.toLong)))
+          .guaranteeCase {
+            case Outcome.Succeeded(_) => F.delay(sendAvailable.set(true))
+            case _                    => F.delay(sendBroken.set(true))
+          }
       writeTasks.getAndUpdate(_ *> writeTask)
       len.toInt
     } else {

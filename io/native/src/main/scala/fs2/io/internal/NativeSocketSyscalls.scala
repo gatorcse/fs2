@@ -131,10 +131,12 @@ private[fs2] object NativeSocketSyscalls extends SocketSyscalls {
 @extern
 private[internal] object nativesocket {
   def socket(domain: CInt, tpe: CInt, protocol: CInt): CInt = extern
-  def close(fd: CInt): CInt = extern
-  def bind(fd: CInt, addr: Ptr[Byte], addrLen: CUnsignedInt): CInt = extern
+  // May block: `close` with a positive SO_LINGER, and `bind`/`connect` on a Unix socket's file.
+  // `@blocking` lets the GC run meanwhile.
+  @blocking def close(fd: CInt): CInt = extern
+  @blocking def bind(fd: CInt, addr: Ptr[Byte], addrLen: CUnsignedInt): CInt = extern
   def listen(fd: CInt, backlog: CInt): CInt = extern
-  def connect(fd: CInt, addr: Ptr[Byte], addrLen: CUnsignedInt): CInt = extern
+  @blocking def connect(fd: CInt, addr: Ptr[Byte], addrLen: CUnsignedInt): CInt = extern
   def accept(fd: CInt, addr: Ptr[Byte], addrLen: Ptr[CUnsignedInt]): CInt = extern
   // Linux and FreeBSD only; only referenced behind LinktimeInfo.isLinux
   def accept4(fd: CInt, addr: Ptr[Byte], addrLen: Ptr[CUnsignedInt], flags: CInt): CInt = extern

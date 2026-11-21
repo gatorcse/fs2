@@ -31,7 +31,7 @@ import com.comcast.ip4s.UnixSocketAddress
 import fs2.io.file.Files
 import fs2.io.internal.FdSockets
 
-import FdPollingIpSocketsProvider.SoMaxConn
+import FdPollingIpSocketsProvider.{SoMaxConn, accepted}
 
 private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](fds: FdSockets)(implicit
     F: Async[F]
@@ -106,19 +106,7 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](fds: FdSoc
       clients = Stream
         .resource {
           // errors (e.g. out of descriptors, or an unsupported option) end the stream, like NIO's
-          Resource
-            .makeFull[F, Int] { poll =>
-              poll {
-                handle
-                  .pollReadRec(()) { _ =>
-                    IO {
-                      val clientFd = serverGate(fds.accept(fd))
-                      if (clientFd >= 0) Right(clientFd) else Left(())
-                    }
-                  }
-                  .to
-              }
-            }(fd => F.delay(fds.close(fd)))
+          accepted[F](fds, fd, handle, serverGate)
             .flatMap { clientFd =>
               Resource.eval(fds.setAcceptedOptionsF(clientFd, c.AF_UNIX, filteredOptions)).flatMap {
                 case false => Resource.pure[F, Option[Socket[F]]](None) // the client has gone
