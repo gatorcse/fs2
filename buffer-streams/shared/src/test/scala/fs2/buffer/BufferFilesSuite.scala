@@ -72,17 +72,6 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
-  test("readLeased and writeLeased copy files of every size, and drain the pool") {
-    sizes.traverse_ { size =>
-      val alloc = checkedAllocator()
-      val files = BufferFiles.withAllocator[IO](alloc)
-      (source(size), Files[IO].tempFile).tupled.use { case ((src, bytes), dst) =>
-        files.readLeased(src, chunk).through(files.writeLeased(dst)).compile.drain >>
-          readBack(dst).map(assertEquals(_, bytes))
-      } >> assertDrained(alloc)
-    }
-  }
-
   test("native chunks are emitted, and sliced without copying") {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     source(3 * chunk).use { case (src, bytes) =>
@@ -119,7 +108,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
-  test("NativeHasher agrees with fs2's hasher in both shapes") {
+  test("NativeHasher agrees with fs2's hasher") {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     val algorithms = List(HashAlgorithm.MD5, HashAlgorithm.SHA1, HashAlgorithm.SHA256)
     source(3 * chunk + 17).use { case (src, bytes) =>
@@ -129,15 +118,11 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
           viaChunks <- NativeHasher[IO](alg).use { h =>
             files.readAll(src, chunk).through(h.observe(_.drain)).compile.lastOrError
           }
-          viaLeases <- NativeHasher[IO](alg).use { h =>
-            files.readLeased(src, chunk).through(h.observeLeased(_.drain)).compile.lastOrError
-          }
           viaHeap <- NativeHasher[IO](alg).use { h =>
             Stream.chunk(bytes).through(h.drain).compile.lastOrError
           }
         } yield {
           assertEquals(viaChunks, expected, alg.toString)
-          assertEquals(viaLeases, expected, alg.toString)
           assertEquals(viaHeap, expected, alg.toString)
         }
       }
@@ -203,34 +188,16 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
-  test("misuse: keeping native chunks or leases past the stream fails under checks") {
+  test("misuse: keeping native chunks past the stream fails under checks") {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     source(3 * chunk).use { case (src, _) =>
       for {
         chunks <- files.readAll(src, chunk).chunks.compile.toList
-        leases <- files.readLeased(src, chunk).compile.toList
       } yield {
         assert(chunks.forall(_.asInstanceOf[NativeChunk].isReleased))
-        assert(leases.forall(_.isReleased))
         intercept[IllegalStateException](chunks.head.toArray)
-        intercept[IllegalStateException](leases.head.toChunk)
-        // The escape hatches copy while the data is still valid.
         ()
       }
-    }
-  }
-
-  test("misuse: a lease used after the next pull fails under checks") {
-    val files = BufferFiles.withAllocator[IO](checkedAllocator())
-    source(3 * chunk).use { case (src, _) =>
-      files
-        .readLeased(src, chunk)
-        .zipWithPrevious
-        .map { case (prev, _) => prev.foreach(_.toChunk) }
-        .compile
-        .drain
-        .intercept[IllegalStateException]
-        .void
     }
   }
 
@@ -244,11 +211,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
           .chunkN(6 * chunk)
           .compile
           .foldMonoid
-        viaLeases <- files.readLeased(src, chunk).through(Leased.toBytes).compile.to(Chunk)
-      } yield {
-        assertEquals(Chunk.array(viaChunks.toArray), bytes)
-        assertEquals(viaLeases, bytes)
-      }
+      } yield assertEquals(Chunk.array(viaChunks.toArray), bytes)
     }
   }
 
@@ -258,7 +221,6 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     source(50 * chunk).use { case (src, _) =>
       List(0, 1, 2, 5).traverse_ { n =>
         files.readAll(src, chunk).chunks.take(n.toLong).compile.drain >>
-          files.readLeased(src, chunk).take(n.toLong).compile.drain >>
           files
             .readAll(src, chunk)
             .evalTap(_ => IO.cede)

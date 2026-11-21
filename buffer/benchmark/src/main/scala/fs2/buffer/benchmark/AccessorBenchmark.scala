@@ -63,7 +63,7 @@ class AccessorBenchmark {
     sum
   }
 
-  private[this] var idx = 100
+  private[this] val idx = 100
 
   @Benchmark
   def nativeBufSingle(): Int = buf.getInt(idx)

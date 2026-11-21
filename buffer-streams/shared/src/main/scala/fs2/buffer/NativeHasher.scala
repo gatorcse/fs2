@@ -22,15 +22,13 @@
 package fs2.buffer
 
 import cats.effect.{Resource, Sync}
-import fs2.{Chunk, Pipe, Stream}
+import fs2.Chunk
 import fs2.hashing.{HashAlgorithm, Hasher}
 
 /** An fs2 `Hasher` that reads native buffers in place.
   *
-  * For the [[NativeChunk]] shape it is a drop-in `Hasher`: `update`, `observe`, `drain`
-  * and `verify` work as in fs2, and native chunks are hashed without a heap copy (other
-  * chunks are hashed as usual). For the [[Leased]] shape, [[updateLeased]] and
-  * [[observeLeased]] do the same over a stream of leases.
+  * A drop-in `Hasher`: `update`, `observe`, `drain` and `verify` work as in fs2, and
+  * [[NativeChunk]]s are hashed without a heap copy (other chunks are hashed as usual).
   *
   * Uses `MessageDigest` on the JVM and OpenSSL's EVP digests on Scala Native.
   */
@@ -52,21 +50,6 @@ abstract class NativeHasher[F[_]] private[buffer] (implicit F: Sync[F]) extends 
 
   /** Adds the bytes of `buf` to the current hash. */
   def updateNative(buf: NativeBuf): F[Unit] = F.delay(unsafeUpdateNative(buf))
-
-  /** Passes leases through, adding each to the current hash on the way. */
-  def updateLeased: Pipe[F, Leased, Leased] =
-    // mapChunks, not map: `Stream.map` runs upstream effects in an interruptible scope,
-    // which costs a race per blocking read and halved upload throughput in the benchmark.
-    _.mapChunks { c =>
-      c.foreach(l => unsafeUpdateNative(l.buf))
-      c
-    }
-
-  /** As `observe`, for a stream of leases: feeds them through this hasher to `sink`, then
-    * emits the hash once both are done.
-    */
-  def observeLeased(sink: Pipe[F, Leased, Nothing]): Pipe[F, Leased, fs2.hashing.Hash] =
-    source => sink(updateLeased(source)) ++ Stream.eval(hash)
 }
 
 object NativeHasher extends NativeHasherPlatform {

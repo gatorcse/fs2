@@ -25,7 +25,6 @@ package benchmark
 import java.lang.management.ManagementFactory
 
 import cats.effect.{ExitCode, IO, IOApp}
-import cats.syntax.all._
 import fs2.Stream
 import fs2.io.file.{Files, Path}
 
@@ -39,7 +38,7 @@ import scala.jdk.CollectionConverters._
   * bufferBenchmark/runMain fs2.buffer.benchmark.FileStreamsBenchmark upload chunk 1024 /tmp/bench
   * }}}
   *
-  * Arguments: `upload|download`, `heap|chunk|leased|sendfile`, size in MiB, work directory.
+  * Arguments: `upload|download`, `heap|chunk|sendfile`, size in MiB, work directory.
   */
 object FileStreamsBenchmark extends IOApp {
 
@@ -54,10 +53,8 @@ object FileStreamsBenchmark extends IOApp {
       val step: IO[Unit] = (op, variant) match {
         case ("upload", "heap")       => Handlers.heap.upload(src, dst).void
         case ("upload", "chunk")      => Handlers.chunk.upload(src, dst).void
-        case ("upload", "leased")     => Handlers.leased.upload(src, dst).void
         case ("download", "heap")     => Handlers.heap.download(src, Path("/dev/null"))
         case ("download", "chunk")    => Handlers.chunk.download(src, Path("/dev/null"))
-        case ("download", "leased")   => Handlers.leased.download(src, Path("/dev/null"))
         case ("download", "sendfile") => Handlers.sendfile.download(src, Path("/dev/null"))
         case _ => IO.raiseError(new IllegalArgumentException(s"$op $variant"))
       }
@@ -72,7 +69,7 @@ object FileStreamsBenchmark extends IOApp {
         _ <- IO.println(report(op, variant, size, times, before, after))
       } yield ExitCode.Success
     case _ =>
-      IO.println("usage: upload|download heap|chunk|leased|sendfile <MiB> <dir>").as(ExitCode.Error)
+      IO.println("usage: upload|download heap|chunk|sendfile <MiB> <dir>").as(ExitCode.Error)
   }
 
   /** Writes `size` bytes of a repeating pattern, once, outside the measurement. */

@@ -23,7 +23,7 @@ package fs2.buffer
 
 import fs2.Chunk
 
-/** Tier-2 shape B: a `Chunk[Byte]` over pooled native memory.
+/** The tier-2 binary chunk: a `Chunk[Byte]` over pooled native memory.
   *
   * It is a real `Chunk`, so every byte-stream combinator, pipe and sink in fs2 accepts it,
   * and `splitAt`, `take` and `drop` slice it without copying. Sinks that know about it

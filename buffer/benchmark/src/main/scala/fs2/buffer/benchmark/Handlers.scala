@@ -26,9 +26,9 @@ import cats.effect.IO
 import fs2.hashing.{Hash, HashAlgorithm, Hashing}
 import fs2.io.file.{Files, Path}
 
-/** The same upload and download handlers written three ways, to compare the two tier-2
-  * shapes against today's heap path. Sockets are not on leases yet (milestone D), so a file
-  * stands in for the request body and a file or `/dev/null` for the response socket.
+/** The same upload and download handlers on today's heap path and on native chunks.
+  * Sockets are not on native buffers yet (milestone D), so a file stands in for the
+  * request body and a file or `/dev/null` for the response socket.
   *
   *   - upload: stream the body to disk and return its SHA-256, as an upload endpoint would;
   *   - download: stream a file to the client.
@@ -47,7 +47,7 @@ object Handlers {
       Files[IO].readAll(file).through(Files[IO].writeAll(client)).compile.drain
   }
 
-  // ---- shape B: NativeChunk, an ordinary Stream[F, Byte] ----
+  // ---- native chunks: an ordinary Stream[F, Byte] ----
 
   object chunk {
     private val files = BufferFiles[IO]
@@ -61,21 +61,7 @@ object Handlers {
       files.readAll(file).through(files.writeAll(client)).compile.drain
   }
 
-  // ---- shape A: Leased, a separate element type ----
-
-  object leased {
-    private val files = BufferFiles[IO]
-
-    def upload(body: Path, dest: Path): IO[Hash] =
-      NativeHasher[IO](HashAlgorithm.SHA256).use { h =>
-        files.readLeased(body).through(h.observeLeased(files.writeLeased(dest))).compile.lastOrError
-      }
-
-    def download(file: Path, client: Path): IO[Unit] =
-      files.readLeased(file).through(files.writeLeased(client)).compile.drain
-  }
-
-  // ---- either shape: no buffer at all ----
+  // ---- no buffer at all ----
 
   object sendfile {
     def download(file: Path, client: Path): IO[Unit] =

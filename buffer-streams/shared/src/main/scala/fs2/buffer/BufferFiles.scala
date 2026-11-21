@@ -30,11 +30,9 @@ import fs2.io.file.Path
   *
   * Each source reads with blocking calls straight into buffers leased from its own
   * [[Magazine]], so file bytes never touch the heap, and holds only a fixed number of
-  * buffers however large the file. Each method comes in both tier-2 shapes:
-  *
-  *   - [[readAll]] / [[writeAll]]: a `Stream[F, Byte]` of [[NativeChunk]]s, valid for a
-  *     rolling window of chunks;
-  *   - [[readLeased]] / [[writeLeased]]: a `Stream[F, Leased]`, each valid for one step.
+  * buffers however large the file. [[readAll]] emits a `Stream[F, Byte]` of
+  * [[NativeChunk]]s, each valid for a rolling window of chunks, and [[writeAll]] writes
+  * them back out without a copy.
   *
   * [[sendFile]] copies file to file (or device) inside the kernel, with no buffer at all.
   */
@@ -49,15 +47,24 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
       path: Path,
       chunkSize: Int = DefaultChunkSize,
       window: Int = DefaultWindow
-  ): Stream[F, Byte] =
-    read(path, chunkSize, window)(b => Pull.output(new NativeChunk(b)))
-
-  /** Reads `path` as leases of `chunkSize` bytes (the last one may be shorter). Each lease
-    * is valid until the stream is pulled again, and the last one until the scope running
-    * this stream closes; see [[Leased]].
-    */
-  def readLeased(path: Path, chunkSize: Int = DefaultChunkSize): Stream[F, Leased] =
-    read(path, chunkSize, 1)(b => Pull.output1(new Leased(b)))
+  ): Stream[F, Byte] = {
+    require(chunkSize > 0, s"chunkSize must be positive, was $chunkSize")
+    // Weak: the file and window belong to the scope that runs this stream, not to the
+    // stream itself, so buffers stay valid until the consuming stage is done with them,
+    // including stages that emit after the source ends (the tail of `chunkN`, `last`).
+    Stream.resourceWeak((openRead(path), leaseWindow(window)).tupled).flatMap { case (file, w) =>
+      def go: Pull[F, Byte, Unit] =
+        Pull
+          .eval(F.delay(w.lease(chunkSize)).flatMap(b => F.blocking(file.read(b)).map(b -> _)))
+          .flatMap { case (b, n) =>
+            if (n < 0) Pull.eval(F.delay(w.discard()))
+            else
+              Pull.eval(F.delay(w.push())) >>
+                Pull.output(new NativeChunk(if (n == b.size) b else b.slice(0, n))) >> go
+          }
+      go.streamNoScope
+    }
+  }
 
   /** Writes a byte stream to `path`. Native chunks are written from native memory with no
     * copy; other chunks are copied into a pooled buffer first.
@@ -66,13 +73,6 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
     in =>
       Stream.resource((openWrite(path, append), leaseWindow(1)).tupled).flatMap {
         case (file, scratch) => in.chunks.foreach(c => F.blocking(writeChunk(file, scratch, c)))
-      }
-
-  /** Writes a stream of leases to `path`, each before the next is pulled. */
-  def writeLeased(path: Path, append: Boolean = false): Pipe[F, Leased, Nothing] =
-    in =>
-      Stream.resource(openWrite(path, append)).flatMap { file =>
-        in.foreach(l => F.blocking(file.write(l.buf)))
       }
 
   /** Copies all of `src` to `dst` inside the kernel where it can (`sendfile` on Linux, or
@@ -92,25 +92,6 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
         pos
       }
     }
-
-  private def read[O](path: Path, chunkSize: Int, window: Int)(
-      emit: NativeBuf => Pull[F, O, Unit]
-  ): Stream[F, O] = {
-    require(chunkSize > 0, s"chunkSize must be positive, was $chunkSize")
-    // Weak: the file and window belong to the scope that runs this stream, not to the
-    // stream itself, so buffers stay valid until the consuming stage is done with them,
-    // including stages that emit after the source ends (the tail of `chunkN`, `last`).
-    Stream.resourceWeak((openRead(path), leaseWindow(window)).tupled).flatMap { case (file, w) =>
-      def go: Pull[F, O, Unit] =
-        Pull
-          .eval(F.delay(w.lease(chunkSize)).flatMap(b => F.blocking(file.read(b)).map(b -> _)))
-          .flatMap { case (b, n) =>
-            if (n < 0) Pull.eval(F.delay(w.discard()))
-            else Pull.eval(F.delay(w.push())) >> emit(if (n == b.size) b else b.slice(0, n)) >> go
-          }
-      go.streamNoScope
-    }
-  }
 
   private def writeChunk(file: NativeFile, scratch: LeaseWindow, c: Chunk[Byte]): Unit =
     c match {
