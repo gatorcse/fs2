@@ -31,6 +31,7 @@ import scala.scalanative.unsafe._
 import scala.scalanative.unsigned._
 
 import fs2.io.file.Path
+import org.typelevel.scalaccompat.annotation.nowarn212
 
 /** A file read and written through native buffers, with blocking calls: plain `read` and
   * `write` on the buffer's pointer, so nothing is copied. Reads and writes are sequential,
@@ -117,6 +118,7 @@ private[buffer] object NativeFile {
   private[buffer] def error(what: String): IOException =
     new IOException(s"$what: ${fromCString(string.strerror(errno.errno))}")
 
+  @nowarn212("cat=unused")
   @extern
   private[buffer] object linux {
     def sendfile(outFd: CInt, inFd: CInt, offset: Ptr[CLongLong], count: CSize): CSSize = extern
