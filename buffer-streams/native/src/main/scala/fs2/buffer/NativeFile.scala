@@ -22,11 +22,19 @@
 package fs2.buffer
 
 import java.io.IOException
+import java.nio.file.{
+  AccessDeniedException,
+  FileAlreadyExistsException,
+  FileSystemException,
+  NoSuchFileException
+}
 
 import scala.scalanative.libc.{errno, string}
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.posix.{fcntl, unistd}
-import scala.scalanative.posix.errno.{EINTR, EINVAL, ENOSYS}
+import scala.scalanative.posix.errno.{EACCES, EEXIST, EINTR, EINVAL, ENOENT, ENOSYS, EPERM}
+import scala.scalanative.posix.sys.stat
+import scala.scalanative.posix.sys.statOps._
 import scala.scalanative.unsafe._
 import scala.scalanative.unsigned._
 
@@ -71,7 +79,12 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
     * `sendfile` on Linux, through a pooled buffer elsewhere or where `sendfile` refuses the
     * pair (an `O_APPEND` target, for one). Returns the bytes copied.
     */
-  def transferTo(position: Long, count: Long, target: NativeFile): Long =
+  def transferTo(
+      position: Long,
+      count: Long,
+      target: NativeFile,
+      allocator: BufferAllocator
+  ): Long =
     if (LinktimeInfo.isLinux) {
       val off = stackalloc[CLongLong]()
       !off = position
@@ -85,11 +98,16 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
           else if (e != EINTR) throw NativeFile.error("sendfile")
         }
       }
-      if (fallback) copyThroughBuffer(position, count, target) else r
-    } else copyThroughBuffer(position, count, target)
+      if (fallback) copyThroughBuffer(position, count, target, allocator) else r
+    } else copyThroughBuffer(position, count, target, allocator)
 
-  private def copyThroughBuffer(position: Long, count: Long, target: NativeFile): Long =
-    BufferAllocator.global.withBuffer(math.min(count, SizeClass.Bulk.toLong).toInt) { buf =>
+  private def copyThroughBuffer(
+      position: Long,
+      count: Long,
+      target: NativeFile,
+      allocator: BufferAllocator
+  ): Long =
+    allocator.withBuffer(math.min(count, SizeClass.Bulk.toLong).toInt) { buf =>
       var r = -1L
       while (r < 0) {
         r = unistd.pread(fd, buf.ptr, buf.size.toCSize, position.toSize).toLong
@@ -99,12 +117,20 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
       r
     }
 
+  /** The file's size, or 0 for a pipe or device (as `FileChannel.size` is on the JVM). */
   def size: Long = {
-    val cur = unistd.lseek(fd, 0, unistd.SEEK_CUR)
-    val end = unistd.lseek(fd, 0, unistd.SEEK_END)
-    if (cur < 0 || end < 0) throw NativeFile.error("lseek")
-    unistd.lseek(fd, cur, unistd.SEEK_SET)
-    end.toLong
+    val st = stackalloc[stat.stat]()
+    if (stat.fstat(fd, st) != 0) throw NativeFile.error("fstat")
+    if (stat.S_ISREG(st.st_mode) != 0) st.st_size.toLong else 0L
+  }
+
+  /** Whether this is the same file as `path`, if `path` exists. */
+  def isSameFile(path: Path): Boolean = {
+    val mine = stackalloc[stat.stat]()
+    val theirs = stackalloc[stat.stat]()
+    if (stat.fstat(fd, mine) != 0) throw NativeFile.error("fstat")
+    val r = Zone.acquire(implicit z => stat.stat(toCString(path.toString), theirs))
+    r == 0 && mine.st_dev == theirs.st_dev && mine.st_ino == theirs.st_ino
   }
 
   // On Linux the descriptor is released even when close fails with EINTR, so that is not
@@ -125,10 +151,28 @@ private[buffer] object NativeFile {
 
   private def open(path: Path, flags: CInt): NativeFile = {
     val fd = Zone.acquire { implicit z =>
-      fcntl.open(toCString(path.toString), flags | fcntl.O_CLOEXEC, Mode)
+      val p = toCString(path.toString)
+      var fd = -1
+      var done = false
+      // Opening a FIFO blocks until the other end opens, so a signal can interrupt it.
+      while (!done) {
+        fd = fcntl.open(p, flags | fcntl.O_CLOEXEC, Mode)
+        done = fd >= 0 || errno.errno != EINTR
+      }
+      fd
     }
-    if (fd < 0) throw error(s"open $path")
+    if (fd < 0) throw openError(path)
     new NativeFile(fd)
+  }
+
+  /** The exception the JVM's `FileChannel.open` throws for the same failure. */
+  private def openError(path: Path): IOException = {
+    val e = errno.errno
+    val p = path.toString
+    if (e == ENOENT) new NoSuchFileException(p)
+    else if (e == EACCES || e == EPERM) new AccessDeniedException(p)
+    else if (e == EEXIST) new FileAlreadyExistsException(p)
+    else new FileSystemException(p, null, fromCString(string.strerror(e)))
   }
 
   private[buffer] def error(what: String): IOException =

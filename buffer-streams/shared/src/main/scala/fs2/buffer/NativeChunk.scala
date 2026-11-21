@@ -38,6 +38,12 @@ import scodec.bits.{BitVector, ByteVector}
   * stage that holds more than that, such as `chunkN` with a large `n`, a `Channel`, a
   * `Topic`, `prefetchN` or `compile.to(Chunk)`, must call [[toHeap]] first.
   *
+  * Anything that hands chunks to another fiber needs [[toHeap]] first too, however few it
+  * holds: `parEvalMap`, `parEvalMapUnordered`, `parJoin`, `prefetch`, `concurrently`,
+  * `Channel` and `Topic` run the source in a scope of its own, which can close and release
+  * the last chunks while the other fiber still uses them. `merge` is safe: it waits for each
+  * chunk to be consumed before pulling the next.
+  *
   * This is a convention the types do not enforce. What a stale chunk does depends on the
   * allocator's checks level:
   *   - Bulk (the default): bulk reads (`toArray`, `copyToArray`, `toArraySlice`,
@@ -63,9 +69,11 @@ final class NativeChunk private[buffer] (
     xs match {
       case bytes: Array[Byte] => buf.copyToArray(0, bytes, start, size)
       case _                  =>
+        // Through a checked bulk copy, so a stale chunk throws here as for Array[Byte].
+        val a = toHeapArray
         var i = 0
-        while (i < size) {
-          xs(start + i) = buf.getByte(i)
+        while (i < a.length) {
+          xs(start + i) = a(i)
           i += 1
         }
     }

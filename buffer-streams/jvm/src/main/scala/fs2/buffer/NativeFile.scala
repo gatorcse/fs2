@@ -25,13 +25,17 @@ import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
 
 import fs2.io.file.Path
+import org.typelevel.scalaccompat.annotation.unused
 
 /** A file read and written through native buffers, with blocking calls. On the JVM a
   * `FileChannel` reading into and writing from direct views of the buffers, so the JDK
   * makes no copy. Reads and writes are sequential, and a read returns what one channel
   * read gives, so pipes and devices stream as data arrives.
   */
-private[buffer] final class NativeFile private (private val ch: FileChannel) {
+private[buffer] final class NativeFile private (
+    private val ch: FileChannel,
+    private val path: java.nio.file.Path
+) {
 
   /** Reads into `buf` from the current position: whatever one channel read returns, at
     * most `buf.size` bytes. Returns the bytes read, or -1 at EOF.
@@ -51,10 +55,21 @@ private[buffer] final class NativeFile private (private val ch: FileChannel) {
   /** Copies up to `count` bytes starting at `position` to `target` inside the kernel where
     * it can (`sendfile` or `copy_file_range` on Linux). Returns the bytes copied.
     */
-  def transferTo(position: Long, count: Long, target: NativeFile): Long =
+  def transferTo(
+      position: Long,
+      count: Long,
+      target: NativeFile,
+      @unused allocator: BufferAllocator
+  ): Long =
     ch.transferTo(position, count, target.ch)
 
+  /** The file's size, or 0 for a pipe or device. */
   def size: Long = ch.size()
+
+  /** Whether this is the same file as `path`, if `path` exists. */
+  def isSameFile(path: Path): Boolean =
+    java.nio.file.Files
+      .exists(path.toNioPath) && java.nio.file.Files.isSameFile(this.path, path.toNioPath)
 
   def close(): Unit = ch.close()
 }
@@ -62,13 +77,14 @@ private[buffer] final class NativeFile private (private val ch: FileChannel) {
 private[buffer] object NativeFile {
 
   def openRead(path: Path): NativeFile =
-    new NativeFile(FileChannel.open(path.toNioPath, StandardOpenOption.READ))
+    new NativeFile(FileChannel.open(path.toNioPath, StandardOpenOption.READ), path.toNioPath)
 
   /** Opens for writing, creating the file or truncating it, or appending with `append`. */
   def openWrite(path: Path, append: Boolean): NativeFile = {
     val mode = if (append) StandardOpenOption.APPEND else StandardOpenOption.TRUNCATE_EXISTING
     new NativeFile(
-      FileChannel.open(path.toNioPath, StandardOpenOption.WRITE, StandardOpenOption.CREATE, mode)
+      FileChannel.open(path.toNioPath, StandardOpenOption.WRITE, StandardOpenOption.CREATE, mode),
+      path.toNioPath
     )
   }
 }

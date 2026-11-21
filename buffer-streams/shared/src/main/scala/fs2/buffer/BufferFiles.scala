@@ -56,6 +56,7 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
       window: Int = DefaultWindow
   ): Stream[F, Byte] = {
     require(chunkSize > 0, s"chunkSize must be positive, was $chunkSize")
+    require(window >= 1, s"window must be at least 1, was $window")
     // The window is weak: it belongs to the scope that runs this stream, not to the stream
     // itself, so buffers stay valid until the consuming stage is done with them, including
     // stages that emit after the source ends (the tail of `chunkN`, `last`). The file needs
@@ -90,21 +91,30 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
     * unless `append`. Returns the bytes copied.
     *
     * `src` must be a regular file: the copy runs to the size `src` has when it starts, so a
-    * pipe or device copies nothing. Use [[readAll]] and [[writeAll]] for those.
+    * pipe or device copies nothing. Use [[readAll]] and [[writeAll]] for those. Copying a
+    * file onto itself fails with an `IOException` rather than truncating it.
     */
   def sendFile(src: Path, dst: Path, append: Boolean = false): F[Long] =
-    (openRead(src), openWrite(dst, append)).tupled.use { case (in, out) =>
-      F.blocking {
-        val size = in.size
-        var pos = 0L
-        var stalled = false
-        while (pos < size && !stalled) {
-          val n = in.transferTo(pos, size - pos, out)
-          if (n <= 0) stalled = true else pos += n
+    openRead(src)
+      .evalTap { in =>
+        F.blocking(in.isSameFile(dst)).flatMap { same =>
+          F.raiseError[Unit](new java.io.IOException(s"sendFile: $src and $dst are the same file"))
+            .whenA(same)
         }
-        pos
       }
-    }
+      .product(openWrite(dst, append))
+      .use { case (in, out) =>
+        F.blocking {
+          val size = in.size
+          var pos = 0L
+          var stalled = false
+          while (pos < size && !stalled) {
+            val n = in.transferTo(pos, size - pos, out, allocator)
+            if (n <= 0) stalled = true else pos += n
+          }
+          pos
+        }
+      }
 
   private def writeChunk(file: NativeFile, scratch: LeaseWindow, c: Chunk[Byte]): Unit =
     c match {

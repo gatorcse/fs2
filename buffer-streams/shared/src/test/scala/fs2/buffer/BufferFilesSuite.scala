@@ -156,6 +156,52 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
+  test("sendFile refuses to copy a file onto itself") {
+    val files = BufferFiles[IO]
+    source(2 * chunk).use { case (src, bytes) =>
+      files.sendFile(src, src).intercept[java.io.IOException] >>
+        readBack(src).map(assertEquals(_, bytes))
+    }
+  }
+
+  test("a missing file fails with NoSuchFileException, as fs2-io does") {
+    Files[IO].tempDirectory.use { dir =>
+      BufferFiles[IO]
+        .readAll(dir / "missing")
+        .compile
+        .drain
+        .intercept[java.nio.file.NoSuchFileException]
+        .void
+    }
+  }
+
+  test("chunks copied to the heap first are safe in concurrent stages") {
+    val files = BufferFiles.withAllocator[IO](checkedAllocator())
+    (source(10 * chunk + 1), source(7 * chunk)).tupled.use { case ((a, ab), (b, bb)) =>
+      for {
+        viaPar <- files
+          .readAll(a, chunk)
+          .through(NativeChunk.heap)
+          .chunks
+          .parEvalMap(3)(c => IO.sleep(2.millis).as(c))
+          .unchunks
+          .compile
+          .to(Chunk)
+        viaJoin <- Stream(a, b)
+          .map(p =>
+            files.readAll(p, chunk).through(NativeChunk.heap).chunks.fold(Chunk.empty[Byte])(_ ++ _)
+          )
+          .parJoin(2)
+          .evalTap(_ => IO.sleep(2.millis))
+          .compile
+          .toList
+      } yield {
+        assertEquals(viaPar, ab)
+        assertEquals(viaJoin.map(_.size).sorted, List(bb.size, ab.size).sorted)
+      }
+    }
+  }
+
   test("toByteVector copies, so it stays correct after the window moves on") {
     // At the default Bulk level element reads are unchecked, so a lazy view would silently
     // read reused memory here.
