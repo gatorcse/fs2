@@ -64,6 +64,7 @@ private[fs2] final class SocketConstants private (
     val SO_SNDBUF: Int,
     val SO_RCVBUF: Int,
     val SO_ERROR: Int,
+    val SO_TYPE: Int,
     /** macOS only; -1 elsewhere. */
     val SO_NOSIGPIPE: Int,
     // IPPROTO_TCP
@@ -156,6 +157,7 @@ private[fs2] object SocketConstants {
     SO_SNDBUF = 7,
     SO_RCVBUF = 8,
     SO_ERROR = 4,
+    SO_TYPE = 3,
     SO_NOSIGPIPE = -1,
     TCP_NODELAY = 1,
     IP_TOS = 1,
@@ -227,6 +229,7 @@ private[fs2] object SocketConstants {
     SO_SNDBUF = 0x1001,
     SO_RCVBUF = 0x1002,
     SO_ERROR = 0x1007,
+    SO_TYPE = 0x1008,
     SO_NOSIGPIPE = 0x1022,
     TCP_NODELAY = 1,
     IP_TOS = 3,

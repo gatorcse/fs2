@@ -70,6 +70,7 @@ class SocketConstantsSuite extends Fs2Suite {
     check("SO_SNDBUF", c.SO_SNDBUF, socket.SO_SNDBUF)
     check("SO_RCVBUF", c.SO_RCVBUF, socket.SO_RCVBUF)
     check("SO_ERROR", c.SO_ERROR, socket.SO_ERROR)
+    check("SO_TYPE", c.SO_TYPE, socket.SO_TYPE)
     check("TCP_NODELAY", c.TCP_NODELAY, tcp.TCP_NODELAY)
     check("IP_MULTICAST_IF", c.IP_MULTICAST_IF, netin.IP_MULTICAST_IF)
     check("IP_MULTICAST_LOOP", c.IP_MULTICAST_LOOP, netin.IP_MULTICAST_LOOP)

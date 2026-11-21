@@ -417,7 +417,11 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     key match {
       case StandardSocketOptions.SO_SNDBUF    => setInt(fd, c.SOL_SOCKET, c.SO_SNDBUF, int)
       case StandardSocketOptions.SO_RCVBUF    => setInt(fd, c.SOL_SOCKET, c.SO_RCVBUF, int)
-      case StandardSocketOptions.SO_REUSEADDR => setInt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, bool)
+      case StandardSocketOptions.SO_REUSEADDR =>
+        setInt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, bool)
+        // Like the JDK: on BSDs, SO_REUSEADDR alone doesn't let datagram sockets share a port
+        if (c.isMac && getInt(fd, c.SOL_SOCKET, c.SO_TYPE) == c.SOCK_DGRAM)
+          setInt(fd, c.SOL_SOCKET, c.SO_REUSEPORT, bool)
       case StandardSocketOptions.SO_REUSEPORT => setInt(fd, c.SOL_SOCKET, c.SO_REUSEPORT, bool)
       case StandardSocketOptions.SO_KEEPALIVE => setInt(fd, c.SOL_SOCKET, c.SO_KEEPALIVE, bool)
       case StandardSocketOptions.SO_BROADCAST => setInt(fd, c.SOL_SOCKET, c.SO_BROADCAST, bool)
