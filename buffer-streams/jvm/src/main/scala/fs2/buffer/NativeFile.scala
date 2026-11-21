@@ -48,7 +48,7 @@ private[buffer] final class NativeFile private (private val ch: FileChannel) {
   /** Writes all of `buf` at the current position. */
   def write(buf: NativeBuf): Unit = {
     val bb = buf.asByteBuffer
-    while (bb.hasRemaining) ch.write(bb)
+    while (bb.hasRemaining) { ch.write(bb); () }
   }
 
   /** Copies up to `count` bytes starting at `position` to `target` inside the kernel where
