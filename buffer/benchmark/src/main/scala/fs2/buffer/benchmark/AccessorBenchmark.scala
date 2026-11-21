@@ -63,7 +63,8 @@ class AccessorBenchmark {
     sum
   }
 
-  private[this] var idx = 100
+  // A var, so the JIT can't fold the index into a constant.
+  var idx = 100
 
   @Benchmark
   def nativeBufSingle(): Int = buf.getInt(idx)

@@ -57,7 +57,7 @@ ThisBuild / githubWorkflowAddedJobs +=
     javas = List(JavaSpec.temurin("25")),
     matrixAdds = Map(
       "scala" -> List("2.12", "2.13", "3"),
-      "project" -> List("bufferJVM", "bufferNative")
+      "project" -> List("bufferJVM", "bufferNative", "bufferStreamsJVM", "bufferStreamsNative")
     ),
     steps = List(
       WorkflowStep.Checkout,
@@ -622,15 +622,41 @@ lazy val buffer = crossProject(JVMPlatform, NativePlatform)
 lazy val bufferJVM = buffer.jvm
 lazy val bufferNative = buffer.native
 
+// Binary streams over fs2-buffer: NativeChunk, file sources and sinks, hashing and
+// sendfile. Kept apart from fs2-buffer so
+// the allocator itself depends on nothing but cats-effect-kernel.
+lazy val bufferStreams = crossProject(JVMPlatform, NativePlatform)
+  .crossType(CrossType.Full)
+  .in(file("buffer-streams"))
+  .dependsOn(buffer, io)
+  .settings(
+    name := "fs2-buffer-streams",
+    tlVersionIntroduced := List("2.12", "2.13", "3").map(_ -> "3.16.0").toMap,
+    mimaPreviousArtifacts := Set.empty,
+    libraryDependencies ++= Seq(
+      "org.typelevel" %%% "cats-effect-testkit" % "3.7.1" % Test,
+      "org.typelevel" %%% "munit-cats-effect" % "2.2.1" % Test
+    )
+  )
+  .jvmSettings(
+    tlJdkRelease := Some(25),
+    Test / fork := true
+  )
+
+lazy val bufferStreamsJVM = bufferStreams.jvm
+lazy val bufferStreamsNative = bufferStreams.native
+
 lazy val bufferBenchmark = project
   .in(file("buffer/benchmark"))
   .enablePlugins(JmhPlugin, NoPublishPlugin)
   .disablePlugins(DoctestPlugin)
   .settings(
     name := "fs2-buffer-benchmark",
-    tlJdkRelease := Some(25)
+    tlJdkRelease := Some(25),
+    run / fork := true,
+    run / javaOptions ++= Seq("-Xmx1g", "-Xms256m")
   )
-  .dependsOn(bufferJVM)
+  .dependsOn(bufferJVM, bufferStreamsJVM)
 
 lazy val scodec = crossProject(JVMPlatform, JSPlatform, NativePlatform)
   .in(file("scodec"))

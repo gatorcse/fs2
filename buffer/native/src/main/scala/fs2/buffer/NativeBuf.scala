@@ -84,7 +84,7 @@ final class NativeBuf private[buffer] (
       throw new IndexOutOfBoundsException(s"index $index, width $width, size $size")
   }
 
-  @inline private def bulk(): Unit =
+  @inline private[buffer] def bulk(): Unit =
     if ((flags & CheckBulk) != 0) checkLive()
 
   private[this] def checkLive(): Unit =
