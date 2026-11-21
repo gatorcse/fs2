@@ -132,7 +132,7 @@ class SocketConstantsSuite extends Fs2Suite {
       assertEquals(fds.localAddress(fd), com.comcast.ip4s.UnixSocketAddress(path))
     } finally {
       fds.close(fd)
-      java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(path))
+      java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(path)): Unit
     }
   }
 }
