@@ -23,12 +23,16 @@ package fs2.buffer
 
 import java.nio.{ByteBuffer => JByteBuffer}
 
+import org.typelevel.scalaccompat.annotation.nowarn212
+
 private[buffer] trait NativeChunkPlatform { self: NativeChunk =>
 
   /** A read-only direct view of the native memory, with no copy. JDK APIs that take a
     * `ByteBuffer` (`FileChannel`, `SSLEngine`, `MessageDigest`) and fs2-io's file and socket
     * writers read it in place. Same lifetime as the chunk.
     */
-  override def toByteBuffer[B >: Byte](implicit ev: B =:= Byte): JByteBuffer =
+  override def toByteBuffer[B >: Byte](implicit
+      @nowarn212("cat=unused") ev: B =:= Byte
+  ): JByteBuffer =
     buf.asByteBuffer.asReadOnlyBuffer()
 }
