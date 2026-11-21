@@ -61,7 +61,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
 
   private val sizes = List(0, 1, chunk - 1, chunk, chunk + 1, 3 * chunk + 5)
 
-  test("readAll and writeAll copy files of every size, and drain the pool") {
+  test("unsafeReadAllNative and writeAll copy files of every size, and drain the pool") {
     sizes.traverse_ { size =>
       val alloc = checkedAllocator()
       val files = BufferFiles.withAllocator[IO](alloc)
@@ -72,7 +72,7 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
-  test("readAll emits heap chunks, copies files of every size, and drains the pool") {
+  test("readAll emits heap chunks, copies files of every size, and holds no native memory") {
     sizes.traverse_ { size =>
       val alloc = checkedAllocator()
       val files = BufferFiles.withAllocator[IO](alloc)
@@ -136,6 +136,16 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
       Stream.chunk(bytes).through(files.writeAll(dst)).compile.drain >>
         readBack(dst).map(assertEquals(_, bytes))
     } >> assertDrained(alloc)
+  }
+
+  test("writeAll appends, and writes heap chunks larger than a buffer") {
+    val files = BufferFiles[IO]
+    val big = Chunk.array(Array.tabulate(300000)(i => (i * 7).toByte))
+    Files[IO].tempFile.use { dst =>
+      Stream.chunk(big).through(files.writeAll(dst)).compile.drain >>
+        Stream.chunk(big).through(files.writeAll(dst, append = true)).compile.drain >>
+        readBack(dst).map(assertEquals(_, big ++ big))
+    }
   }
 
   test("native chunks flow into fs2-io's own file writer") {
@@ -259,30 +269,35 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
-  test("readAll closes each file at end of input, even inside flatMap") {
+  test("unsafeReadAllNative frees its file and buffers at end of input, even inside flatMap") {
     val fdDir = java.nio.file.Paths.get("/proc/self/fd")
     def openFds = IO.blocking(java.nio.file.Files.list(fdDir).count())
-    val files = BufferFiles[IO]
+    val alloc = checkedAllocator()
+    val files = BufferFiles.withAllocator[IO](alloc)
     IO.blocking(java.nio.file.Files.isDirectory(fdDir)).flatMap { linux =>
       assume(linux, "needs /proc/self/fd")
       source(chunk + 1).use { case (src, _) =>
         for {
           before <- openFds
-          during <- IO.ref(0L)
-          // Counted straight after the reads, in the same scope: the files must already be
-          // closed, not just released when that scope ends.
+          during <- IO.ref((0L, 0))
+          // Counted straight after the reads, in the same scope: each file and window must
+          // already be released, not just when that scope ends.
           _ <- (Stream.range(0, 50).flatMap(_ => files.unsafeReadAllNative(src, chunk)) ++
-            Stream.exec(openFds.flatMap(during.set))).compile.drain
+            Stream.exec(openFds.flatMap(n => during.set((n, alloc.stats.magazines))))).compile.drain
           after <- during.get
-        } yield assert(after < before + 10, s"$before fds before, $after during")
+        } yield {
+          assert(after._1 < before + 10, s"$before fds before, ${after._1} during")
+          assertEquals(after._2, 0, "magazines still open")
+        }
       }
     }
   }
 
   test("a stage holding chunks within the window works") {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
-    source(10 * chunk).use { case (src, bytes) =>
-      // 3 chunks of 4: within the default window of 4.
+    source(9 * chunk).use { case (src, bytes) =>
+      // 3 chunks of 4: within the default window of 4. Every group fills before the file
+      // ends, so none is used after the source's buffers are freed.
       files
         .unsafeReadAllNative(src, chunk)
         .chunkN(3 * chunk)
@@ -307,18 +322,12 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
-  test(
-    "misuse: behind a scope boundary, a stage emitting after the source ends sees released chunks"
-  ) {
+  test("misuse: a stage emitting after the source ends sees released chunks") {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     source(10 * chunk).use { case (src, _) =>
-      // `chunks` opens a scope that closes when the source ends, before `chunkN` emits its
-      // final partial group, so that group is already released. Without the boundary the
-      // same pipeline works (see "a stage holding chunks within the window works").
+      // chunkN's last, partial group is emitted after the source has ended.
       files
         .unsafeReadAllNative(src, chunk)
-        .chunks
-        .unchunks
         .chunkN(3 * chunk)
         .map(_.toArray)
         .compile

@@ -28,11 +28,10 @@ import fs2.io.file.Path
 
 /** Binary file streams over pooled native buffers: the tier-2 sources and sinks.
   *
-  * Each source reads with blocking calls into buffers leased from its own [[Magazine]],
-  * and holds only a fixed number of buffers however large the file.
+  * Reads and writes are blocking calls on the file descriptor (a `FileChannel` on the JVM).
   *
-  *   - [[readAll]] copies each read into an ordinary heap chunk. Its chunks are safe
-  *     anywhere, like fs2-io's.
+  *   - [[readAll]] reads into ordinary heap chunks, like fs2-io's. Its chunks are safe
+  *     anywhere.
   *   - [[unsafeReadAllNative]] emits [[NativeChunk]]s over the pooled memory itself, so
   *     file bytes never touch the heap, at the price of a lifetime rule the types don't
   *     enforce. For pipelines that send the bytes straight on, to [[writeAll]], a hasher or
@@ -45,24 +44,18 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
   import BufferFiles._
 
   /** Reads `path` as heap chunks of up to `chunkSize` bytes: full-size from a regular file
-    * except the last, and whatever has arrived from a pipe or device. Each read goes into a
-    * pooled native buffer and is copied out to a fresh array, so the chunks are ordinary
-    * `Chunk[Byte]`s with no lifetime rules. The file is closed at end of input.
+    * except the last, and whatever has arrived from a pipe or device. Each read goes
+    * straight into a fresh array, as fs2-io's `Files.readAll` does, so the chunks are
+    * ordinary `Chunk[Byte]`s with no lifetime rules and no native memory is held. The file
+    * is closed at end of input.
     */
   def readAll(path: Path, chunkSize: Int = DefaultChunkSize): Stream[F, Byte] = {
     require(chunkSize > 0, s"chunkSize must be positive, was $chunkSize")
-    Stream.resource((openRead(path), leaseWindow(1)).tupled).flatMap { case (file, scratch) =>
+    Stream.resource(openRead(path)).flatMap { file =>
       val readChunk: F[Option[Chunk[Byte]]] = F.blocking {
-        val b = scratch.lease(chunkSize)
-        try {
-          val n = file.read(b)
-          if (n < 0) None
-          else {
-            val a = new Array[Byte](n)
-            b.copyToArray(0, a, 0, n)
-            Some(Chunk.array(a))
-          }
-        } finally scratch.discard()
+        val a = new Array[Byte](chunkSize)
+        val n = file.read(a)
+        if (n < 0) None else Some(Chunk.array(a, 0, n))
       }
       Stream.repeatEval(readChunk).unNoneTerminate.unchunks
     }
@@ -71,16 +64,13 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
   /** Reads `path` as native chunks of up to `chunkSize` bytes, with no copy: full-size from
     * a regular file except the last, and whatever has arrived from a pipe or device.
     *
-    * '''Unsafe:''' each chunk stays valid only while `window - 1` more are emitted, and the
-    * last ones until the scope running this stream closes. A stage that holds chunks longer,
-    * or hands them to another fiber, must copy them with [[NativeChunk.heap]] first; see
-    * [[NativeChunk]] for the rules. Use [[readAll]] unless the bytes go straight on.
-    *
-    * The file is closed as soon as it is read to the end. The window's buffers stay with the
-    * enclosing scope, so a stream that reads many files one after another, such as
-    * `paths.flatMap(files.unsafeReadAllNative(_))`, holds one window per file read so far
-    * until that scope ends. Add `.scope` to each inner stream to release each
-    * window when its file is done, if nothing downstream holds its chunks past that point.
+    * '''Unsafe:''' each chunk stays valid only while `window - 1` more are emitted, and
+    * never after this stream ends: the file and every buffer are released at end of input
+    * (or on error or cancellation). A stage that holds chunks longer, holds them past the
+    * end of the file (the last group of `chunkN`, `last`), or hands them to another fiber
+    * (`merge`, `parEvalMap`, `parJoin`, `prefetch`...) must copy them with
+    * [[NativeChunk.heap]] first; see [[NativeChunk]]. Use [[readAll]] unless the bytes go
+    * straight on, to [[writeAll]], a hasher or a socket.
     */
   def unsafeReadAllNative(
       path: Path,
@@ -89,33 +79,27 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
   ): Stream[F, Byte] = {
     require(chunkSize > 0, s"chunkSize must be positive, was $chunkSize")
     require(window >= 1, s"window must be at least 1, was $window")
-    // The window is weak: it belongs to the scope that runs this stream, not to the stream
-    // itself, so buffers stay valid until the consuming stage is done with them, including
-    // stages that emit after the source ends (the tail of `chunkN`, `last`). The file needs
-    // no such grace, so it gets its own scope and closes at end of input.
-    Stream.resourceWeak(leaseWindow(window)).flatMap { w =>
-      Stream.resource(openRead(path)).flatMap { file =>
-        def go: Pull[F, Byte, Unit] =
-          Pull
-            .eval(F.delay(w.lease(chunkSize)).flatMap(b => F.blocking(file.read(b)).map(b -> _)))
-            .flatMap { case (b, n) =>
-              if (n < 0) Pull.eval(F.delay(w.discard()))
-              else
-                Pull.eval(F.delay(w.push())) >>
-                  Pull.output(new NativeChunk(if (n == b.size) b else b.slice(0, n))) >> go
-            }
-        go.streamNoScope
-      }
+    Stream.resource((openRead(path), leaseWindow(window)).tupled).flatMap { case (file, w) =>
+      def go: Pull[F, Byte, Unit] =
+        Pull
+          .eval(F.delay(w.lease(chunkSize)).flatMap(b => F.blocking(file.read(b)).map(b -> _)))
+          .flatMap { case (b, n) =>
+            if (n < 0) Pull.eval(F.delay(w.discard()))
+            else
+              Pull.eval(F.delay(w.push())) >>
+                Pull.output(new NativeChunk(if (n == b.size) b else b.slice(0, n))) >> go
+          }
+      go.stream
     }
   }
 
-  /** Writes a byte stream to `path`. Native chunks are written from native memory with no
-    * copy; other chunks are copied into a pooled buffer first.
+  /** Writes a byte stream to `path`: native chunks from native memory, other chunks from
+    * their arrays, with no copy either way and no buffer held.
     */
   def writeAll(path: Path, append: Boolean = false): Pipe[F, Byte, Nothing] =
     in =>
-      Stream.resource((openWrite(path, append), leaseWindow(1)).tupled).flatMap {
-        case (file, scratch) => in.chunks.foreach(c => F.blocking(writeChunk(file, scratch, c)))
+      Stream.resource(openWrite(path, append)).flatMap { file =>
+        in.chunks.foreach(c => F.blocking(writeChunk(file, c)))
       }
 
   /** Copies all of `src` to `dst` inside the kernel where it can (`sendfile` on Linux, or
@@ -148,21 +132,12 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
         }
       }
 
-  private def writeChunk(file: NativeFile, scratch: LeaseWindow, c: Chunk[Byte]): Unit =
+  private def writeChunk(file: NativeFile, c: Chunk[Byte]): Unit =
     c match {
       case n: NativeChunk => file.write(n.buf)
       case _              =>
-        val s = c.toArraySlice
-        var off = 0
-        while (off < s.length) {
-          val len = math.min(DefaultChunkSize, s.length - off)
-          val b = scratch.lease(len)
-          try {
-            b.copyFromArray(s.values, s.offset + off, 0, len)
-            file.write(b)
-          } finally scratch.discard()
-          off += len
-        }
+        val sl = c.toArraySlice
+        file.write(sl.values, sl.offset, sl.length)
     }
 
   private def openRead(path: Path): Resource[F, NativeFile] =

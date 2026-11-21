@@ -46,11 +46,21 @@ private[buffer] final class NativeFile private (
     if (r <= 0) -1 else r
   }
 
-  /** Writes all of `buf` at the current position. */
-  def write(buf: NativeBuf): Unit = {
-    val bb = buf.asByteBuffer
-    while (bb.hasRemaining) { ch.write(bb); () }
+  /** As `read`, into `a` (which must be non-empty). */
+  def read(a: Array[Byte]): Int = {
+    val r = ch.read(java.nio.ByteBuffer.wrap(a))
+    if (r <= 0) -1 else r
   }
+
+  /** Writes all of `buf` at the current position. */
+  def write(buf: NativeBuf): Unit = write(buf.asByteBuffer)
+
+  /** Writes `length` bytes of `a` from `offset` at the current position. */
+  def write(a: Array[Byte], offset: Int, length: Int): Unit =
+    write(java.nio.ByteBuffer.wrap(a, offset, length))
+
+  private def write(bb: java.nio.ByteBuffer): Unit =
+    while (bb.hasRemaining) { ch.write(bb); () }
 
   /** Copies up to `count` bytes starting at `position` to `target` inside the kernel where
     * it can (`sendfile` or `copy_file_range` on Linux). Returns the bytes copied.

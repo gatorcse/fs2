@@ -32,17 +32,20 @@ import scodec.bits.{BitVector, ByteVector}
   * (this module's file writer and hasher, and anything that uses `toByteBuffer` on the JVM,
   * such as fs2-io's `Files.writeAll`) read the native memory directly.
   *
-  * '''Lifetime.''' The source that emits it owns a rolling window of buffers (default 4). A
-  * chunk stays valid while `window - 1` more chunks are emitted, and is released as the
-  * source fills the next one; the last chunks stay valid until the source's scope closes. A
-  * stage that holds more than that, such as `chunkN` with a large `n`, a `Channel`, a
-  * `Topic`, `prefetchN` or `compile.to(Chunk)`, must call [[toHeap]] first.
+  * '''Lifetime.''' The source that emits it ([[BufferFiles.unsafeReadAllNative]]) owns a
+  * rolling window of buffers (default 4). A chunk stays valid while `window - 1` more
+  * chunks are emitted, and is released as the source fills the next one; every chunk is
+  * released when the source's stream ends. So a stage needs [[toHeap]] (or the
+  * [[NativeChunk.heap]] pipe) first if it:
+  *   - holds more chunks than that, such as `chunkN` with a large `n`, `compile.to(Chunk)`
+  *     or `compile.toList`;
+  *   - uses chunks after the source has ended, such as the last group of `chunkN`, `last`
+  *     or `takeRight`;
+  *   - hands chunks to another fiber, however few: `merge`, `parEvalMap`, `parJoin`,
+  *     `prefetch`, `Channel`, `Topic`, or a stream run in the background of `concurrently`.
   *
-  * Anything that hands chunks to another fiber needs [[toHeap]] first too, however few it
-  * holds: `parEvalMap`, `parEvalMapUnordered`, `parJoin`, `prefetch`, `concurrently`,
-  * `Channel` and `Topic` run the source in a scope of its own, which can close and release
-  * the last chunks while the other fiber still uses them. `merge` is safe: it waits for each
-  * chunk to be consumed before pulling the next.
+  * Sequential stages that use each chunk and move on (`map`, `evalMap`, `through` a sink,
+  * this module's writer and hasher, fs2-io's writers) need nothing.
   *
   * This is a convention the types do not enforce. What a stale chunk does depends on the
   * allocator's checks level:

@@ -26,9 +26,9 @@ package fs2.buffer
   * A source leases a buffer with [[lease]], fills it, and then either [[push]]es it, which
   * releases the buffer pushed `size` pushes ago, or [[discard]]s it at end of input. So at
   * most `size` pushed buffers are live and each stays valid for `size - 1` further pushes,
-  * and the last ones stay valid until [[close]]. This is [[NativeChunk]]'s rolling window
-  * (a window of 1 serves as scratch space for one buffer at a time). A buffer between
-  * `lease` and `push` is owned by the window too, so cancellation then leaks nothing.
+  * and the last ones stay valid until [[close]]. This is [[NativeChunk]]'s rolling window.
+  * A buffer between `lease` and `push` is owned by the window too, so cancellation then
+  * leaks nothing.
   *
   * Owned by one stream, whose steps run one at a time (possibly on different threads, with
   * the fiber handoff ordering them), so it allocates from its own [[Magazine]] without

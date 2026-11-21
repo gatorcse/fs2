@@ -53,10 +53,17 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
     */
   def read(buf: NativeBuf): Int = {
     buf.bulk()
+    read(buf.ptr, buf.size)
+  }
+
+  /** As `read`, into `a` (which must be non-empty). */
+  def read(a: Array[Byte]): Int = read(a.atUnsafe(0), a.length)
+
+  private def read(p: Ptr[Byte], size: Int): Int = {
     var r = -1
     var done = false
     while (!done) {
-      r = unistd.read(fd, buf.ptr, buf.size.toCSize).toInt
+      r = unistd.read(fd, p, size.toCSize).toInt
       if (r >= 0) done = true
       else if (errno.errno != EINTR) throw NativeFile.error("read")
     }
@@ -66,14 +73,26 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
   /** Writes all of `buf` at the current position. */
   def write(buf: NativeBuf): Unit = {
     buf.bulk()
+    write(buf.ptr, buf.size)
+  }
+
+  /** Writes `length` bytes of `a` from `offset` at the current position. */
+  def write(a: Array[Byte], offset: Int, length: Int): Unit =
+    if (length > 0) write(a.atUnsafe(offset), length)
+
+  private def write(p: Ptr[Byte], size: Int): Unit = {
     var n = 0
-    while (n < buf.size) {
-      val r = unistd.write(fd, buf.ptr + n, (buf.size - n).toCSize).toInt
+    while (n < size) {
+      val r = unistd.write(fd, p + n, (size - n).toCSize).toInt
       if (r > 0) n += r
       else if (r == 0) throw new IOException("write: wrote 0 bytes")
       else if (errno.errno != EINTR) throw NativeFile.error("write")
     }
   }
+
+  // Set once sendfile refuses this pair, so the rest of the copy skips straight to the
+  // buffered path instead of paying a failed syscall per step.
+  private[this] var sendfileRefused = false
 
   /** Copies up to `count` bytes starting at `position` to `target`: inside the kernel with
     * `sendfile` on Linux, through a pooled buffer elsewhere or where `sendfile` refuses the
@@ -86,19 +105,22 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
       allocator: BufferAllocator
   ): Long =
     if (LinktimeInfo.isLinux) {
-      val off = stackalloc[CLongLong]()
-      !off = position
-      var r = -1L
-      var fallback = false
-      while (r < 0 && !fallback) {
-        r = NativeFile.linux.sendfile(target.fd, fd, off, count.toCSize).toLong
-        if (r < 0) {
-          val e = errno.errno
-          if (e == EINVAL || e == ENOSYS) fallback = true
-          else if (e != EINTR) throw NativeFile.error("sendfile")
+      if (sendfileRefused) copyThroughBuffer(position, count, target, allocator)
+      else {
+        val off = stackalloc[CLongLong]()
+        !off = position
+        var r = -1L
+        var fallback = false
+        while (r < 0 && !fallback) {
+          r = NativeFile.linux.sendfile(target.fd, fd, off, count.toCSize).toLong
+          if (r < 0) {
+            val e = errno.errno
+            if (e == EINVAL || e == ENOSYS) { fallback = true; sendfileRefused = true }
+            else if (e != EINTR) throw NativeFile.error("sendfile")
+          }
         }
+        if (fallback) copyThroughBuffer(position, count, target, allocator) else r
       }
-      if (fallback) copyThroughBuffer(position, count, target, allocator) else r
     } else copyThroughBuffer(position, count, target, allocator)
 
   private def copyThroughBuffer(

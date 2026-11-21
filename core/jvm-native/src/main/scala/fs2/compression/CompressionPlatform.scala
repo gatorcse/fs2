@@ -467,7 +467,7 @@ private[compression] trait CompressionCompanionPlatform
       private def _gzip_trailer(deflater: Deflater, crc32: CRC32): Stream[F, Byte] = {
         // See RFC 1952: https://www.ietf.org/rfc/rfc1952.txt
         val crc32Value = crc32.getValue
-        val bytesIn = deflater.getBytesRead // getTotalIn is deprecated as of JDK 25
+        val bytesIn = deflater.getBytesRead // getTotalIn is deprecated in recent JDKs
         val trailer = Array[Byte](
           (crc32Value & 0xff).toByte, // CRC-32: Cyclic Redundancy Check
           ((crc32Value >> 8) & 0xff).toByte,
