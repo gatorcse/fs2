@@ -1,0 +1,214 @@
+/*
+ * Copyright (c) 2013 Functional Streams for Scala
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+package fs2
+package io
+package net
+
+import cats.effect.{Async, FileDescriptorPollHandle, IO, LiftIO, Resource}
+import cats.effect.std.Mutex
+import cats.syntax.all._
+import com.comcast.ip4s.{
+  Dns,
+  GenSocketAddress,
+  IpAddress,
+  MulticastJoin,
+  NetworkInterface,
+  SocketAddress
+}
+import fs2.io.internal.FdSockets
+
+import java.io.IOException
+import java.net.{NetworkInterface => JNetworkInterface}
+
+import FdPollingDatagramSocket.MaxDatagramSize
+
+/** A datagram socket on a `FileDescriptorPoller`, shared by Scala Native and the JVM (with
+  * `fs2-io-ffm`).
+  */
+private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
+    fds: FdSockets,
+    fd: Int,
+    domain: Int,
+    handle: FileDescriptorPollHandle,
+    readMutex: Mutex[F],
+    writeMutex: Mutex[F],
+    override val address: SocketAddress[IpAddress]
+)(implicit F: Async[F])
+    extends DatagramSocket[F] {
+
+  private[this] val c = fds.c
+
+  def localAddress: F[SocketAddress[IpAddress]] = F.pure(address)
+
+  def read: F[Datagram] = readMutex.lock.surround {
+    handle
+      .pollReadRec(()) { _ =>
+        IO {
+          // the largest possible datagram; copied out before this fiber can suspend
+          val buf = FdPollingSocket.scratchBuffer(MaxDatagramSize)
+          val length = new Array[Int](1)
+          val from = fds.recvFrom(fd, buf, 0, math.min(buf.length, MaxDatagramSize), length)
+          // a zero-length datagram still has a sender
+          if (from eq null) Left(())
+          else
+            Right(
+              Datagram(from.asIpUnsafe, Chunk.array(java.util.Arrays.copyOf(buf, length(0))))
+            )
+        }
+      }
+      .to
+  }
+
+  def readGen: F[GenDatagram] = read.map(_.toGenDatagram)
+
+  def reads: Stream[F, Datagram] = Stream.repeatEval(read)
+
+  private[this] def write0(bytes: Chunk[Byte], to: GenSocketAddress): F[Unit] =
+    writeMutex.lock.surround {
+      val Chunk.ArraySlice(buf, offset, length) = bytes.toArraySlice
+      handle
+        .pollWriteRec(()) { _ =>
+          IO {
+            // a datagram is sent whole or not at all
+            if (fds.sendTo(fd, buf, offset, length, to) >= 0) Either.unit else Left(())
+          }
+        }
+        .to
+    }
+
+  def write(bytes: Chunk[Byte], address: GenSocketAddress): F[Unit] = write0(bytes, address)
+
+  def write(bytes: Chunk[Byte]): F[Unit] = write0(bytes, null)
+
+  def writes: Pipe[F, Datagram, Nothing] = _.evalMap(write).drain
+
+  def connect(address: GenSocketAddress): F[Unit] =
+    F.delay {
+      // connecting a datagram socket only sets its peer, so it never blocks
+      if (!fds.connect(fd, address))
+        throw new IOException(s"Datagram connect to $address did not complete")
+    }
+
+  def disconnect: F[Unit] = F.delay(fds.disconnect(fd))
+
+  def getOption[A](key: SocketOption.Key[A]): F[Option[A]] =
+    fds.getOptionF[F, A](fd, domain, key)
+
+  def setOption[A](key: SocketOption.Key[A], value: A): F[Unit] =
+    fds.setOptionF[F, A](fd, domain, key, value)
+
+  def supportedOptions: F[Set[SocketOption.Key[?]]] =
+    F.pure(fds.supportedOptions(datagram = true))
+
+  override def join(
+      join: MulticastJoin[IpAddress],
+      interface: NetworkInterface
+  ): F[GroupMembership] =
+    F.delay(Option(JNetworkInterface.getByName(interface.name))).flatMap {
+      case Some(jinterface) => this.join(join, jinterface)
+      case None => F.raiseError(new IOException(s"No such network interface: ${interface.name}"))
+    }
+
+  override def join(
+      join: MulticastJoin[IpAddress],
+      interface: JNetworkInterface
+  ): F[GroupMembership] =
+    F.delay {
+      val index = interface.getIndex
+      val (group, source) = join.fold(
+        j => (j.group.address: IpAddress, None),
+        j => (j.group.address: IpAddress, Some(j.source: IpAddress))
+      )
+      fds.multicast(
+        fd,
+        if (source.isEmpty) c.MCAST_JOIN_GROUP else c.MCAST_JOIN_SOURCE_GROUP,
+        index,
+        group,
+        source
+      )
+      new GroupMembership {
+        def drop = F.delay {
+          fds.multicast(
+            fd,
+            if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
+            index,
+            group,
+            source
+          )
+        }
+        def block(blocked: IpAddress) = F.delay {
+          if (source.isDefined)
+            throw new IllegalStateException("Cannot block sources of a source-specific join")
+          fds.multicast(fd, c.MCAST_BLOCK_SOURCE, index, group, Some(blocked))
+        }
+        def unblock(blocked: IpAddress) = F.delay {
+          if (source.isDefined)
+            throw new IllegalStateException("Cannot unblock sources of a source-specific join")
+          fds.multicast(fd, c.MCAST_UNBLOCK_SOURCE, index, group, Some(blocked))
+        }
+        override def toString = "GroupMembership"
+      }
+    }
+}
+
+private object FdPollingDatagramSocket {
+
+  /** The largest UDP payload over IPv4 or IPv6 (without jumbograms). */
+  private final val MaxDatagramSize = 65535
+
+  def apply[F[_]: LiftIO](
+      fds: FdSockets,
+      fd: Int,
+      domain: Int,
+      handle: FileDescriptorPollHandle,
+      address: SocketAddress[IpAddress]
+  )(implicit F: Async[F]): Resource[F, DatagramSocket[F]] =
+    Resource.eval((Mutex[F], Mutex[F]).mapN { (readMutex, writeMutex) =>
+      new FdPollingDatagramSocket(fds, fd, domain, handle, readMutex, writeMutex, address)
+    })
+}
+
+private final class FdPollingIpDatagramSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets)(implicit
+    F: Async[F]
+) extends IpDatagramSocketsProvider[F] {
+
+  override def bindDatagramSocket(
+      address: SocketAddress[com.comcast.ip4s.Host],
+      options: List[SocketOption]
+  ): Resource[F, DatagramSocket[F]] = for {
+    poller <- Resource.eval(fileDescriptorPoller[F])
+    host <- Resource.eval(address.host.resolve[F])
+    bindTo = SocketAddress(host, address.port)
+    domain = fds.domainOf(bindTo)
+    fd <- fds.openNonBlocking(domain, fds.c.SOCK_DGRAM)
+    _ <- Resource.eval(fds.setOptionsF(fd, domain, options))
+    _ <- Resource.eval(F.delay(fds.bind(fd, bindTo)))
+    handle <- poller.registerFileDescriptor(fd, true, true).mapK(LiftIO.liftK)
+    socket <- FdPollingDatagramSocket[F](
+      fds,
+      fd,
+      domain,
+      handle,
+      fds.localAddress(fd).asIpUnsafe
+    )
+  } yield socket
+}

@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) 2013 Functional Streams for Scala
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+package fs2
+package io
+package net
+
+import cats.effect.IO
+import cats.effect.LiftIO
+import cats.effect.kernel.Async
+import cats.effect.kernel.Resource
+import cats.syntax.all._
+import com.comcast.ip4s._
+import fs2.io.internal.FdSockets
+
+import FdPollingIpSocketsProvider.SoMaxConn
+
+private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets)(implicit
+    F: Async[F]
+) extends IpSocketsProvider[F] {
+
+  private[this] val c = fds.c
+
+  override def connectIp(
+      to: SocketAddress[Host],
+      options: List[SocketOption]
+  ): Resource[F, Socket[F]] = for {
+    poller <- Resource.eval(fileDescriptorPoller[F])
+    address <- Resource.eval(to.resolve)
+    domain = fds.domainOf(address)
+    fd <- fds.openNonBlocking(domain, c.SOCK_STREAM)
+    _ <- Resource.eval(fds.setOptionsF(fd, domain, options))
+    handle <- poller.registerFileDescriptor(fd, true, true).mapK(LiftIO.liftK)
+    _ <- Resource.eval {
+      handle
+        .pollWriteRec(false) { connecting =>
+          IO {
+            if (connecting) {
+              // Writability doesn't prove the connection completed: the poller may wake us
+              // early, e.g. for an event from before connect was called.
+              if (fds.finishConnect(fd)) Either.unit else Left(true)
+            } else if (fds.connect(fd, address)) Either.unit
+            else Left(true) // we will be connected when we unblock
+          }
+        }
+        .to
+    }
+    socket <- FdPollingSocket[F](
+      fds,
+      fd,
+      domain,
+      handle,
+      fds.localAddress(fd),
+      fds.peerAddress(fd)
+    )
+  } yield socket
+
+  override def bindIp(
+      address: SocketAddress[Host],
+      options: List[SocketOption]
+  ): Resource[F, ServerSocket[F]] = for {
+    poller <- Resource.eval(fileDescriptorPoller[F])
+    (filteredOptions, backlog) = SocketOption.extractBacklog(options)
+    resolvedHost <- Resource.eval(address.host.resolve)
+    domain = fds.domainOf(SocketAddress(resolvedHost, address.port))
+    fd <- fds.openNonBlocking(domain, c.SOCK_STREAM)
+    handle <- poller.registerFileDescriptor(fd, true, false).mapK(LiftIO.liftK)
+
+    _ <- Resource.eval {
+      F.delay(fds.setInt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, 1)) *>
+        F.delay(fds.bind(fd, SocketAddress(resolvedHost, address.port))) *>
+        F.delay(fds.listen(fd, backlog.getOrElse(SoMaxConn)))
+    }
+
+    sockets = Stream
+      .resource {
+        val accepted = for {
+          clientFd <- Resource.makeFull[F, Int] { poll =>
+            poll {
+              handle
+                .pollReadRec(()) { _ =>
+                  IO {
+                    val clientFd = fds.accept(fd)
+                    if (clientFd >= 0) Right(clientFd) else Left(())
+                  }
+                }
+                .to
+            }
+          }(clientFd => F.delay(fds.close(clientFd)))
+          _ <- Resource.eval(fds.setOptionsF(clientFd, domain, filteredOptions))
+          handle <- poller.registerFileDescriptor(clientFd, true, true).mapK(LiftIO.liftK)
+          socket <- FdPollingSocket[F](
+            fds,
+            clientFd,
+            domain,
+            handle,
+            fds.localAddress(clientFd),
+            fds.peerAddress(clientFd)
+          )
+        } yield socket
+
+        accepted.attempt.map(_.toOption)
+      }
+      .repeat
+      .unNone
+
+    info = new SocketInfo[F] {
+      def getOption[A](key: SocketOption.Key[A]) = fds.getOptionF[F, A](fd, domain, key)
+      def setOption[A](key: SocketOption.Key[A], value: A) =
+        fds.setOptionF[F, A](fd, domain, key, value)
+      def supportedOptions = F.pure(fds.supportedOptions(datagram = false))
+      val address = fds.localAddress(fd)
+    }
+  } yield ServerSocket(info, sockets)
+
+}
+
+private object FdPollingIpSocketsProvider {
+
+  /** `SOMAXCONN`; the kernel clamps larger values to its own limit. */
+  private[net] final val SoMaxConn = 4096
+}

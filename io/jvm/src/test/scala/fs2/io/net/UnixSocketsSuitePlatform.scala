@@ -27,6 +27,10 @@ import cats.syntax.all._
 import com.comcast.ip4s.UnixSocketAddress
 
 trait UnixSocketsSuitePlatform { self: UnixSocketsSuite =>
+
+  /** The socket class `Network[IO]` picks with this suite's runtime. */
+  protected def networkSocketClassName: String = "SelectingSocket"
+
   private def testBindFailureKeepsPath(
       provider: String,
       sockets: UnixSocketsProvider[IO]
@@ -83,8 +87,8 @@ trait UnixSocketsSuitePlatform { self: UnixSocketsSuite =>
         }
         .use { case (client, accepted) =>
           IO {
-            assertEquals(client.getClass.getSimpleName, "SelectingSocket")
-            assertEquals(accepted.getClass.getSimpleName, "SelectingSocket")
+            assertEquals(client.getClass.getSimpleName, networkSocketClassName)
+            assertEquals(accepted.getClass.getSimpleName, networkSocketClassName)
           }
         }
     }

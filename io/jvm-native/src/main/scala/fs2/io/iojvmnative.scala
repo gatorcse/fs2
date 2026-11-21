@@ -22,6 +22,7 @@
 package fs2
 package io
 
+import cats.effect.{FileDescriptorPoller, IO, LiftIO}
 import cats.effect.kernel.{Async, Deferred, Outcome, Resource, Sync}
 import cats.effect.kernel.implicits._
 import cats.syntax.all._
@@ -31,6 +32,17 @@ import java.io.{InputStream, OutputStream}
 import scala.reflect.ClassTag
 
 private[fs2] trait iojvmnative {
+
+  /** The runtime's `FileDescriptorPoller`, which backs the poller-based sockets. */
+  private[fs2] def fileDescriptorPoller[F[_]: LiftIO]: F[FileDescriptorPoller] =
+    IO.pollers
+      .flatMap(
+        _.collectFirst { case poller: FileDescriptorPoller => poller }.liftTo[IO](
+          new RuntimeException("Installed PollingSystem does not provide a FileDescriptorPoller")
+        )
+      )
+      .to
+
   type InterruptedIOException = java.io.InterruptedIOException
   type ClosedChannelException = java.nio.channels.ClosedChannelException
 

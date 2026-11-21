@@ -26,6 +26,7 @@ package net
 import cats.effect.{Async, LiftIO}
 
 import com.comcast.ip4s.Dns
+import fs2.io.internal.NativeSocketSyscalls
 
 private[net] trait NetworkPlatform[F[_]]
 
@@ -34,11 +35,18 @@ private[net] trait NetworkCompanionPlatform extends NetworkLowPriority { self: N
   implicit def forLiftIO[F[_]: Async: LiftIO]: Network[F] =
     new AsyncProviderBasedNetwork[F] {
       protected def mkIpSocketsProvider =
-        new FdPollingIpSocketsProvider[F]()(Dns.forAsync, implicitly, implicitly)
-      protected def mkUnixSocketsProvider = new FdPollingUnixSocketsProvider[F]
+        new FdPollingIpSocketsProvider[F](NativeSocketSyscalls.sockets)(
+          Dns.forAsync,
+          implicitly,
+          implicitly
+        )
+      protected def mkUnixSocketsProvider =
+        new FdPollingUnixSocketsProvider[F](NativeSocketSyscalls.sockets)
       protected def mkIpDatagramSocketsProvider =
-        throw new UnsupportedOperationException(
-          "Datagram sockets not currently supported on Native"
+        new FdPollingIpDatagramSocketsProvider[F](NativeSocketSyscalls.sockets)(
+          Dns.forAsync,
+          implicitly,
+          implicitly
         )
       protected def mkUnixDatagramSocketsProvider =
         throw new UnsupportedOperationException(

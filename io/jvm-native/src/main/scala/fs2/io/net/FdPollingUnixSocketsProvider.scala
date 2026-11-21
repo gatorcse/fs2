@@ -29,21 +29,15 @@ import cats.syntax.all._
 import com.comcast.ip4s.UnixSocketAddress
 
 import fs2.io.file.Files
-import fs2.io.internal.NativeUtil._
-import fs2.io.internal.SocketHelpers
-import fs2.io.internal.syssocket.{connect => uconnect, bind => ubind, _}
+import fs2.io.internal.FdSockets
 
-import scala.scalanative.meta.LinktimeInfo
-import scala.scalanative.posix.string._
-import scala.scalanative.posix.sys.socket.{accept => _, _}
-import scala.scalanative.posix.sys.un._
-import scala.scalanative.posix.sys.unOps._
-import scala.scalanative.posix.unistd._
-import scala.scalanative.unsafe._
-import scala.scalanative.unsigned._
+import FdPollingIpSocketsProvider.SoMaxConn
 
-private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](implicit F: Async[F])
-    extends UnixSocketsProvider[F] {
+private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](fds: FdSockets)(implicit
+    F: Async[F]
+) extends UnixSocketsProvider[F] {
+
+  private[this] val c = fds.c
 
   override def connectUnix(
       address: UnixSocketAddress,
@@ -51,27 +45,26 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](implicit F
   ): Resource[F, Socket[F]] =
     for {
       poller <- Resource.eval(fileDescriptorPoller[F])
-      fd <- SocketHelpers.openNonBlocking(AF_UNIX, SOCK_STREAM)
-      _ <- Resource.eval(options.traverse(so => SocketHelpers.setOption(fd, so.key, so.value)))
+      fd <- fds.openNonBlocking(c.AF_UNIX, c.SOCK_STREAM)
+      _ <- Resource.eval(fds.setOptionsF(fd, c.AF_UNIX, options))
       handle <- poller.registerFileDescriptor(fd, true, true).mapK(LiftIO.liftK)
       _ <- Resource.eval {
         handle
-          .pollWriteRec(false) { connected =>
-            if (connected) SocketHelpers.checkSocketError[IO](fd).as(Either.unit)
-            else
-              IO {
-                toSockaddrUn(address.path) { addr =>
-                  if (guard(uconnect(fd, addr, sizeof[sockaddr_un].toUInt)) < 0)
-                    Left(true) // we will be connected when unblocked
-                  else
-                    Either.unit[Boolean]
-                }
-              }
+          .pollWriteRec(false) { connecting =>
+            IO {
+              if (connecting) {
+                fds.checkSocketError(fd)
+                Either.unit
+              } else if (fds.connect(fd, address)) Either.unit
+              else Left(true) // we will be connected when unblocked
+            }
           }
           .to
       }
       socket <- FdPollingSocket[F](
+        fds,
         fd,
+        c.AF_UNIX,
         handle,
         UnixSocketAddress(""),
         address
@@ -92,21 +85,19 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](implicit F
 
       _ <- Resource.eval(deleteIfExists)
 
-      fd <- SocketHelpers.openNonBlocking(AF_UNIX, SOCK_STREAM)
+      fd <- fds.openNonBlocking(c.AF_UNIX, c.SOCK_STREAM)
 
       handle <- poller.registerFileDescriptor(fd, true, false).mapK(LiftIO.liftK)
       _ <- Resource.eval {
-        F.delay {
-          toSockaddrUn(address.path)(addr => guard_(ubind(fd, addr, sizeof[sockaddr_un].toUInt)))
-        } *> F.delay(guard_(listen(fd, backlog.getOrElse(SOMAXCONN))))
+        F.delay(fds.bind(fd, address)) *> F.delay(fds.listen(fd, backlog.getOrElse(SoMaxConn)))
       }
 
       address0 = address
       info = new SocketInfo[F] {
-        def getOption[A](key: SocketOption.Key[A]) = SocketHelpers.getOption(fd, key)
+        def getOption[A](key: SocketOption.Key[A]) = fds.getOptionF[F, A](fd, c.AF_UNIX, key)
         def setOption[A](key: SocketOption.Key[A], value: A) =
-          SocketHelpers.setOption(fd, key, value)
-        def supportedOptions = SocketHelpers.supportedOptions
+          fds.setOptionF[F, A](fd, c.AF_UNIX, key, value)
+        def supportedOptions = F.pure(fds.supportedOptions(datagram = false))
         val address = address0
       }
 
@@ -118,32 +109,20 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](implicit F
                 handle
                   .pollReadRec(()) { _ =>
                     IO {
-                      val clientFd =
-                        if (LinktimeInfo.isLinux)
-                          guard(accept4(fd, null, null, SOCK_NONBLOCK))
-                        else
-                          guard(accept(fd, null, null))
-
-                      if (clientFd >= 0)
-                        Right(clientFd)
-                      else
-                        Left(())
+                      val clientFd = fds.accept(fd)
+                      if (clientFd >= 0) Right(clientFd) else Left(())
                     }
                   }
                   .to
               }
-            }(fd => F.delay(guard_(close(fd))))
-            _ <-
-              if (!LinktimeInfo.isLinux)
-                Resource.eval(setNonBlocking(fd))
-              else Resource.unit[F]
+            }(fd => F.delay(fds.close(fd)))
 
-            _ <- Resource.eval(
-              filteredOptions.traverse(so => SocketHelpers.setOption(fd, so.key, so.value))
-            )
+            _ <- Resource.eval(fds.setOptionsF(fd, c.AF_UNIX, filteredOptions))
             handle <- poller.registerFileDescriptor(fd, true, true).mapK(LiftIO.liftK)
             socket <- FdPollingSocket[F](
+              fds,
               fd,
+              c.AF_UNIX,
               handle,
               address,
               UnixSocketAddress("")
@@ -156,17 +135,5 @@ private final class FdPollingUnixSocketsProvider[F[_]: Files: LiftIO](implicit F
         .unNone
 
     } yield ServerSocket(info, clients)).flatMap(server => deleteOnClose.map(_ => server))
-  }
-
-  private def toSockaddrUn[A](path: String)(f: Ptr[sockaddr] => A): A = {
-    val pathBytes = path.getBytes
-    if (pathBytes.length > 107)
-      throw new IllegalArgumentException(s"Path too long: $path")
-
-    val addr = stackalloc[sockaddr_un]()
-    addr.sun_family = AF_UNIX.toUShort
-    memcpy(addr.sun_path.at(0), pathBytes.atUnsafe(0), pathBytes.length.toUSize)
-
-    f(addr.asInstanceOf[Ptr[sockaddr]])
   }
 }
