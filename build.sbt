@@ -48,6 +48,37 @@ ThisBuild / githubWorkflowAddedJobs +=
 
 ThisBuild / githubWorkflowPublishNeeds += "macos"
 
+ThisBuild / githubWorkflowAddedJobs +=
+  WorkflowJob(
+    "buffer",
+    "Test fs2-buffer (JDK 25)",
+    scalas = Nil,
+    sbtStepPreamble = Nil,
+    javas = List(JavaSpec.temurin("25")),
+    matrixAdds = Map(
+      "scala" -> List("2.12", "2.13", "3"),
+      "project" -> List("bufferJVM", "bufferNative")
+    ),
+    steps = List(
+      WorkflowStep.Checkout,
+      WorkflowStep.Use(UseRef.Public("sbt", "setup-sbt", "v1"), name = Some("Setup sbt")),
+      WorkflowStep.Use(
+        UseRef.Public("actions", "setup-java", "v5"),
+        name = Some("Setup Java (temurin@25)"),
+        params = Map("distribution" -> "temurin", "java-version" -> "25", "cache" -> "sbt")
+      ),
+      WorkflowStep.Sbt(
+        List(
+          "++ ${{ matrix.scala }}",
+          "${{ matrix.project }}/test",
+          "${{ matrix.project }}/headerCheckAll",
+          "${{ matrix.project }}/scalafmtCheckAll"
+        ),
+        name = Some("Test")
+      )
+    )
+  )
+
 ThisBuild / licenses := List(("MIT", url("http://opensource.org/licenses/MIT")))
 
 ThisBuild / doctestTestFramework := DoctestTestFramework.ScalaCheck
@@ -564,6 +595,42 @@ lazy val io = crossProject(JVMPlatform, JSPlatform, NativePlatform)
       )
     )
   )
+
+// Pooled native buffers for the JVM (FFM, JDK 25+) and Scala Native.
+// Not aggregated into `root`, so the main CI matrix (JDK 17 and 21) is unaffected;
+// the `buffer` workflow job below builds it on JDK 25.
+lazy val buffer = crossProject(JVMPlatform, NativePlatform)
+  .crossType(CrossType.Full)
+  .in(file("buffer"))
+  .settings(
+    name := "fs2-buffer",
+    tlVersionIntroduced := List("2.12", "2.13", "3").map(_ -> "3.16.0").toMap,
+    mimaPreviousArtifacts := Set.empty,
+    libraryDependencies ++= Seq(
+      "org.typelevel" %%% "cats-effect-kernel" % "3.7.1",
+      "org.typelevel" %%% "cats-effect" % "3.7.1" % Test,
+      "org.typelevel" %%% "cats-effect-testkit" % "3.7.1" % Test,
+      "org.typelevel" %%% "munit-cats-effect" % "2.2.1" % Test,
+      "org.scalameta" %%% "munit-scalacheck" % "1.2.0" % Test
+    )
+  )
+  .jvmSettings(
+    tlJdkRelease := Some(25),
+    Test / fork := true
+  )
+
+lazy val bufferJVM = buffer.jvm
+lazy val bufferNative = buffer.native
+
+lazy val bufferBenchmark = project
+  .in(file("buffer/benchmark"))
+  .enablePlugins(JmhPlugin, NoPublishPlugin)
+  .disablePlugins(DoctestPlugin)
+  .settings(
+    name := "fs2-buffer-benchmark",
+    tlJdkRelease := Some(25)
+  )
+  .dependsOn(bufferJVM)
 
 lazy val scodec = crossProject(JVMPlatform, JSPlatform, NativePlatform)
   .in(file("scodec"))
