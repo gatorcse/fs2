@@ -173,13 +173,15 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
       }
       new GroupMembership {
         def drop = F.delay {
-          gate.apply(fds.multicast(
-            fd,
-            if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
-            index,
-            group,
-            source
-          ))
+          gate.apply(
+            fds.multicast(
+              fd,
+              if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
+              index,
+              group,
+              source
+            )
+          )
         }
         def block(blocked: IpAddress) = F.delay {
           if (source.isDefined)

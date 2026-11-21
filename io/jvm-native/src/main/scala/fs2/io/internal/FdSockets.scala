@@ -152,7 +152,9 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
   def accept(fd: Int): Int = {
     // ECONNABORTED: a pending connection was reset before we took it; take the next one
     def accept0() =
-      guardMask(sys.accept(fd, c.SOCK_NONBLOCK_CLOEXEC))(e => e == c.ECONNABORTED || c.wouldBlock(e))
+      guardMask(sys.accept(fd, c.SOCK_NONBLOCK_CLOEXEC))(e =>
+        e == c.ECONNABORTED || c.wouldBlock(e)
+      )
     var client = accept0()
     while (client == -c.ECONNABORTED) client = accept0()
     if (client < 0) client = -1 // would block

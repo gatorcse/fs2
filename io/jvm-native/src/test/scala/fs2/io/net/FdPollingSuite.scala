@@ -156,16 +156,18 @@ abstract class FdPollingSuite extends Fs2Suite {
     (
       Network[IO].bindDatagramSocket(SocketAddress(ip"0.0.0.0", Port.Wildcard)),
       Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard))
-    ).tupled.use { case (wildcard, peer) =>
-      val wildcardPort = wildcard.address.asIpUnsafe.port
-      for {
-        _ <- wildcard.write(Datagram(peer.address.asIpUnsafe, msg))
-        received <- peer.read
-        _ = assertEquals(received.remote, SocketAddress(ip"127.0.0.1": IpAddress, wildcardPort))
-        _ <- peer.write(Datagram(received.remote, msg))
-        reply <- wildcard.read
-      } yield assertEquals(reply.remote, peer.address.asIpUnsafe)
-    }.timeout(10.seconds)
+    ).tupled
+      .use { case (wildcard, peer) =>
+        val wildcardPort = wildcard.address.asIpUnsafe.port
+        for {
+          _ <- wildcard.write(Datagram(peer.address.asIpUnsafe, msg))
+          received <- peer.read
+          _ = assertEquals(received.remote, SocketAddress(ip"127.0.0.1": IpAddress, wildcardPort))
+          _ <- peer.write(Datagram(received.remote, msg))
+          reply <- wildcard.read
+        } yield assertEquals(reply.remote, peer.address.asIpUnsafe)
+      }
+      .timeout(10.seconds)
   }
 
   test("a connected datagram socket can write to its peer's address") {
@@ -173,10 +175,12 @@ abstract class FdPollingSuite extends Fs2Suite {
     (
       Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard)),
       Network[IO].bindDatagramSocket(SocketAddress(ip"127.0.0.1", Port.Wildcard))
-    ).tupled.use { case (sender, peer) =>
-      sender.connect(peer.address) >>
-        sender.write(Datagram(peer.address.asIpUnsafe, msg)) >>
-        peer.read.map(d => assertEquals(d.bytes, msg))
-    }.timeout(10.seconds)
+    ).tupled
+      .use { case (sender, peer) =>
+        sender.connect(peer.address) >>
+          sender.write(Datagram(peer.address.asIpUnsafe, msg)) >>
+          peer.read.map(d => assertEquals(d.bytes, msg))
+      }
+      .timeout(10.seconds)
   }
 }
