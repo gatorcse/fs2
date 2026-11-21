@@ -33,11 +33,11 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
 
   private val chunk = 4096
 
-  private def checkedAllocator() =
+  private def checkedAllocator(checks: Checks = Checks.Full) =
     BufferAllocator(
       BufferAllocator.Config(
         idleTimeout = 1.hour,
-        checks = Checks.Full,
+        checks = checks,
         poison = true,
         leakDetection = LeakDetection.Off
       )
@@ -135,6 +135,58 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
       files.sendFile(src, dst).flatMap { n =>
         assertEquals(n, bytes.size.toLong)
         readBack(dst).map(assertEquals(_, bytes))
+      }
+    }
+  }
+
+  test("sendFile appends, and copies an empty file") {
+    val files = BufferFiles[IO]
+    (source(3 * chunk + 9), source(0), Files[IO].tempFile).tupled.use {
+      case ((src, bytes), (empty, _), dst) =>
+        for {
+          _ <- files.sendFile(src, dst)
+          n <- files.sendFile(src, dst, append = true)
+          m <- files.sendFile(empty, dst, append = true)
+          out <- readBack(dst)
+        } yield {
+          assertEquals(n, bytes.size.toLong)
+          assertEquals(m, 0L)
+          assertEquals(out, bytes ++ bytes)
+        }
+    }
+  }
+
+  test("toByteVector copies, so it stays correct after the window moves on") {
+    // At the default Bulk level element reads are unchecked, so a lazy view would silently
+    // read reused memory here.
+    val files = BufferFiles.withAllocator[IO](checkedAllocator(Checks.Bulk))
+    source(10 * chunk + 3).use { case (src, bytes) =>
+      for {
+        bv <- files.readAll(src, chunk).compile.to(scodec.bits.ByteVector)
+        bits <- files.readAll(src, chunk).chunks.map(_.toBitVector).compile.toList
+      } yield {
+        assertEquals(bv, bytes.toByteVector)
+        assertEquals(bits.reduce(_ ++ _), bytes.toBitVector)
+      }
+    }
+  }
+
+  test("readAll closes each file at end of input, even inside flatMap") {
+    val fdDir = java.nio.file.Paths.get("/proc/self/fd")
+    def openFds = IO.blocking(java.nio.file.Files.list(fdDir).count())
+    val files = BufferFiles[IO]
+    IO.blocking(java.nio.file.Files.isDirectory(fdDir)).flatMap { linux =>
+      assume(linux, "needs /proc/self/fd")
+      source(chunk + 1).use { case (src, _) =>
+        for {
+          before <- openFds
+          during <- IO.ref(0L)
+          // Counted straight after the reads, in the same scope: the files must already be
+          // closed, not just released when that scope ends.
+          _ <- (Stream.range(0, 50).flatMap(_ => files.readAll(src, chunk)) ++
+            Stream.exec(openFds.flatMap(during.set))).compile.drain
+          after <- during.get
+        } yield assert(after < before + 10, s"$before fds before, $after during")
       }
     }
   }

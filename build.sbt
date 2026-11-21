@@ -622,8 +622,8 @@ lazy val buffer = crossProject(JVMPlatform, NativePlatform)
 lazy val bufferJVM = buffer.jvm
 lazy val bufferNative = buffer.native
 
-// Leased binary streams over fs2-buffer: file sources and sinks, hashing, sendfile, and the
-// two tier-2 shapes being compared (NativeChunk and Leased). Kept apart from fs2-buffer so
+// Binary streams over fs2-buffer: NativeChunk, file sources and sinks, hashing and
+// sendfile. Kept apart from fs2-buffer so
 // the allocator itself depends on nothing but cats-effect-kernel.
 lazy val bufferStreams = crossProject(JVMPlatform, NativePlatform)
   .crossType(CrossType.Full)
