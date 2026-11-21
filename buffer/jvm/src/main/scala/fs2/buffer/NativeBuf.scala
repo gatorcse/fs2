@@ -79,7 +79,7 @@ final class NativeBuf private[buffer] (
   private[this] def full(): Unit =
     if ((flags & CheckFull) != 0) checkLive()
 
-  private def bulk(): Unit =
+  private[buffer] def bulk(): Unit =
     if ((flags & CheckBulk) != 0) checkLive()
 
   private[this] def checkLive(): Unit =
