@@ -28,45 +28,53 @@ import scodec.bits.{BitVector, ByteVector}
 /** The tier-2 binary chunk: a `Chunk[Byte]` over pooled native memory.
   *
   * It is a real `Chunk`, so every byte-stream combinator, pipe and sink in fs2 accepts it,
-  * and `splitAt`, `take` and `drop` slice it without copying. Sinks that know about it
-  * (this module's file writer and hasher, and anything that uses `toByteBuffer` on the JVM,
-  * such as fs2-io's `Files.writeAll`) read the native memory directly.
+  * and `splitAt`, `take` and `drop` slice it without copying. This module's file writer and
+  * hasher read the native memory directly. Everything that turns it into something else
+  * (`toArray`, `toByteBuffer`, `toByteVector`, `toBitVector`) copies, so the result
+  * outlives the chunk.
   *
   * '''Lifetime.''' The source that emits it ([[BufferFiles.unsafeReadAllNative]]) owns a
   * rolling window of buffers (default 4). A chunk stays valid while `window - 1` more
   * chunks are emitted, and is released as the source fills the next one; every chunk is
   * released when the source's stream ends. So a stage needs [[toHeap]] (or the
   * [[NativeChunk.heap]] pipe) first if it:
-  *   - holds more chunks than that, such as `chunkN` with a large `n`, `compile.to(Chunk)`
-  *     or `compile.toList`;
-  *   - uses chunks after the source has ended, such as the last group of `chunkN`, `last`
-  *     or `takeRight`;
-  *   - hands chunks to another fiber, however few: `merge`, `parEvalMap`, `parJoin`,
-  *     `prefetch`, `Channel`, `Topic`, or a stream run in the background of `concurrently`.
+  *   - holds more chunks than that: `chunkN` with a large `n`, `compile.to(Chunk)`,
+  *     `groupWithin`, `sliding`;
+  *   - emits chunks after the source has ended: the last group of `chunkN`,
+  *     `groupAdjacentBy`, `split`, `takeRight`;
+  *   - hands chunks to another fiber: `merge`, `parEvalMap`, `parJoin`, `prefetch`,
+  *     `broadcastThrough`, `observeAsync`, `Channel`, `Topic`, or a stream run in the
+  *     background of `concurrently`.
   *
-  * Sequential stages that use each chunk and move on (`map`, `evalMap`, `through` a sink,
-  * this module's writer and hasher, fs2-io's writers) need nothing.
+  * Stages that use each chunk and move on need nothing: `map`, `evalMap`, `through` a sink,
+  * `observe`, `last`, `compile.toList` (which copies the bytes out), this module's writer
+  * and hasher, and fs2-io's writers.
   *
   * This is a convention the types do not enforce. What a stale chunk does depends on the
   * allocator's checks level:
-  *   - Bulk (the default): bulk reads (`toArray`, `copyToArray`, `toArraySlice`,
-  *     `toByteBuffer`, `toByteVector`, writes and hashing) throw `IllegalStateException`,
-  *     but element reads (`apply`, `iterator`, `foreach`, `map`) are not checked and read
-  *     whatever the buffer holds next;
+  *   - Bulk (the default): copies, writes, hashing, `iterator`, `foreach` and `map` throw
+  *     `IllegalStateException`; a single-byte `apply` is not checked. It reads whatever the
+  *     buffer holds next, and on Scala Native it can crash the process if that memory has
+  *     been returned to the OS;
   *   - Full: every read throws;
   *   - Off: nothing is checked.
-  *
-  * `toByteVector` and `toBitVector` copy, since scodec-bits views are read later.
   */
 final class NativeChunk private[buffer] (
     /** The memory behind this chunk, exactly [[size]] bytes, shared with the source's lease. */
     val buf: NativeBuf
-) extends Chunk[Byte]
-    with NativeChunkPlatform {
+) extends Chunk[Byte] {
 
   def size: Int = buf.size
 
   def apply(i: Int): Byte = buf.getByte(i)
+
+  // Element-wise traversals check liveness once on entry, so a stale chunk fails here at
+  // the default checks level rather than reading reused memory byte by byte.
+  override def iterator: Iterator[Byte] = { buf.bulk(); super.iterator }
+
+  override def foreach(f: Byte => Unit): Unit = { buf.bulk(); super.foreach(f) }
+
+  override def map[O2](f: Byte => O2): Chunk[O2] = { buf.bulk(); super.map(f) }
 
   def copyToArray[O2 >: Byte](xs: Array[O2], start: Int): Unit =
     xs match {

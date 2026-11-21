@@ -110,6 +110,33 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
+  test("unsafeReadAllNative handles chunks larger than the pooled sizes") {
+    val alloc = checkedAllocator()
+    val files = BufferFiles.withAllocator[IO](alloc)
+    (source(3 * 1024 * 1024 + 7), Files[IO].tempFile).tupled.use { case ((src, bytes), dst) =>
+      files.unsafeReadAllNative(src, 1024 * 1024).through(files.writeAll(dst)).compile.drain >>
+        readBack(dst).map(assertEquals(_, bytes))
+    } >> assertDrained(alloc)
+  }
+
+  test("charset decoding keeps no view of native memory past the source") {
+    // decodeWithCharset can hold part of a chunk as a ByteBuffer and decode it after the
+    // source ends; toByteBuffer copies, so that part stays correct.
+    assume(java.nio.charset.Charset.isSupported("Shift_JIS"), "needs Shift_JIS")
+    val cs = java.nio.charset.Charset.forName("Shift_JIS")
+    val files = BufferFiles.withAllocator[IO](checkedAllocator())
+    val text = ("native chunks " * 75).take(1050)
+    Files[IO].tempFile.use { src =>
+      Stream.chunk(Chunk.array(text.getBytes(cs))).through(Files[IO].writeAll(src)).compile.drain >>
+        files
+          .unsafeReadAllNative(src, 4096)
+          .through(fs2.text.decodeWithCharset(cs))
+          .compile
+          .string
+          .map(assertEquals(_, text))
+    }
+  }
+
   test("native chunks are emitted, and sliced without copying") {
     val files = BufferFiles.withAllocator[IO](checkedAllocator())
     source(3 * chunk).use { case (src, bytes) =>
@@ -334,6 +361,36 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
         .drain
         .intercept[IllegalStateException]
         .void
+    }
+  }
+
+  test("misuse: broadcastThrough hands chunks to other fibers") {
+    val files = BufferFiles.withAllocator[IO](checkedAllocator())
+    source(10 * chunk).use { case (src, _) =>
+      files
+        .unsafeReadAllNative(src, chunk)
+        .broadcastThrough(
+          (s: Stream[IO, Byte]) => s.chunks.evalMap(c => IO.sleep(1.milli).as(c.toArray)).drain,
+          (s: Stream[IO, Byte]) => s.drain
+        )
+        .compile
+        .drain
+        .intercept[IllegalStateException]
+        .void
+    }
+  }
+
+  test("element traversals of a stale chunk fail at the default checks level") {
+    val files = BufferFiles.withAllocator[IO](checkedAllocator(Checks.Bulk))
+    source(3 * chunk).use { case (src, _) =>
+      files.unsafeReadAllNative(src, chunk).chunks.compile.toList.map { chunks =>
+        val c = chunks.head
+        intercept[IllegalStateException](c.iterator.size)
+        intercept[IllegalStateException](c.foreach(_ => ()))
+        intercept[IllegalStateException](c.map(_ + 1))
+        intercept[IllegalStateException](c.toByteBuffer)
+        ()
+      }
     }
   }
 

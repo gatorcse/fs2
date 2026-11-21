@@ -47,7 +47,7 @@ object Handlers {
       Files[IO].readAll(file).through(Files[IO].writeAll(client)).compile.drain
   }
 
-  // ---- BufferFiles.readAll: pooled reads copied out to heap chunks ----
+  // ---- BufferFiles.readAll: heap chunks, the safe default (should match today's) ----
 
   object copy {
     private val files = BufferFiles[IO]
