@@ -111,7 +111,22 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
     * IPv4 where IPv6 is unavailable. Returns the descriptor and its address family.
     */
   def openForBind[F[_]](host: IpAddress, tpe: Int)(implicit F: Sync[F]): Resource[F, (Int, Int)] =
-    if (host == Ipv4Address.Wildcard && !ipv6Available)
+    openForBind0(host, tpe).evalTap { case (fd, domain) =>
+      F.delay {
+        if (c.isLinux && tpe == c.SOCK_DGRAM) {
+          // like the JDK: only the multicast groups this socket joined (IPv6: Linux 4.20+)
+          setInt(fd, c.IPPROTO_IP, c.IP_MULTICAST_ALL, 0)
+          if (domain == c.AF_INET6)
+            bestEffort(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_ALL, intBytes(0))
+        }
+      }
+    }
+
+  private[this] def openForBind0[F[_]](host: IpAddress, tpe: Int)(implicit
+      F: Sync[F]
+  ): Resource[F, (Int, Int)] =
+    if ((host == Ipv4Address.Wildcard || host == Ipv6Address.Wildcard) && !ipv6Available)
+      // `::` too, like the JDK, which binds the IPv4 wildcard when IPv6 is unavailable
       openNonBlocking(c.AF_INET, tpe).map((_, c.AF_INET))
     else if (host == Ipv4Address.Wildcard)
       Resource.make {
@@ -321,6 +336,8 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
             ip.port
           )
         case v4: Ipv4Address => encodeIn(v4, ip.port)
+        case v6: Ipv6Address if domain == c.AF_INET && v6 == Ipv6Address.Wildcard =>
+          encodeIn(Ipv4Address.Wildcard, ip.port) // `::` on a host without IPv6
         case v6: Ipv6Address => encodeIn6(v6, ip.port)
         case other           =>
           throw new IllegalArgumentException(s"Unresolved address: $other")
@@ -555,11 +572,13 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
       // Linux sends IPv4 traffic from a dual-stack socket with its IPv4 options, so, like the
       // JDK, an IPv6 socket there also gets the IPv4 option (best effort)
       case StandardSocketOptions.IP_TOS =>
+        if (int < 0 || int > 255) throw new IllegalArgumentException("Invalid IP_TOS value")
         if (v6) {
           setInt(fd, c.IPPROTO_IPV6, c.IPV6_TCLASS, int)
           if (c.isLinux) bestEffort(fd, c.IPPROTO_IP, c.IP_TOS, intBytes(int))
         } else setInt(fd, c.IPPROTO_IP, c.IP_TOS, int)
       case StandardSocketOptions.IP_MULTICAST_TTL =>
+        if (int < 0 || int > 255) throw new IllegalArgumentException("Invalid TTL/hop value")
         if (v6) {
           setInt(fd, c.IPPROTO_IPV6, c.IPV6_MULTICAST_HOPS, int)
           if (c.isLinux) bestEffort(fd, c.IPPROTO_IP, c.IP_MULTICAST_TTL, intBytes(int))

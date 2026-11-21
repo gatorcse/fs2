@@ -66,8 +66,9 @@ private final class FdPollingIpSocketsProvider[F[_]: Dns: LiftIO](fds: FdSockets
         }
         .to
     }
-    addresses <- Resource.eval(F.delay((fds.localAddress(fd), fds.peerAddress(fd))))
-    socket <- FdPollingSocket[F](fds, fd, domain, handle, addresses._1, addresses._2)
+    // the peer is where we connected, like NIO: getpeername would fail if it had reset already
+    local <- Resource.eval(F.delay(fds.localAddress(fd)))
+    socket <- FdPollingSocket[F](fds, fd, domain, handle, local, address)
   } yield socket
 
   override def bindIp(

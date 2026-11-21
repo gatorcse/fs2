@@ -451,6 +451,8 @@ ThisBuild / mimaBinaryIssueFilters ++= Seq(
   ProblemFilters.exclude[MissingClassProblem]("fs2.io.net.unixsocket.FdPollingUnixSockets"),
   // private poller-based socket classes, now shared by the JVM and Native over SocketSyscalls
   ProblemFilters.exclude[Problem]("fs2.io.net.FdPolling*"),
+  // private
+  ProblemFilters.exclude[Problem]("fs2.io.net.tls.S2nConnection#SendCallbackContext*"),
   ProblemFilters.exclude[IncompatibleResultTypeProblem](
     "fs2.io.net.AsynchronousDatagramSocketGroup#WriterDatagram.remote"
   ),

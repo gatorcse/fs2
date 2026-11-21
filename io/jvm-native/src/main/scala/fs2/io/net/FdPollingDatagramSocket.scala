@@ -186,21 +186,23 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
           source
         )
       }
+      val dropped = new java.util.concurrent.atomic.AtomicBoolean(false)
       new GroupMembership {
-        // like NIO, dropping a membership of a closed socket does nothing
+        // like NIO, dropping a membership again, or of a closed socket, does nothing
         def drop = F.delay {
-          try
-            gate.apply(
-              fds.multicast(
-                fd,
-                domain,
-                if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
-                index,
-                group,
-                source
+          if (!dropped.getAndSet(true))
+            try
+              gate.apply(
+                fds.multicast(
+                  fd,
+                  domain,
+                  if (source.isEmpty) c.MCAST_LEAVE_GROUP else c.MCAST_LEAVE_SOURCE_GROUP,
+                  index,
+                  group,
+                  source
+                )
               )
-            )
-          catch { case _: java.nio.channels.ClosedChannelException => () }
+            catch { case _: java.nio.channels.ClosedChannelException => () }
         }
         def block(blocked: IpAddress) = F.delay {
           if (source.isDefined)

@@ -80,6 +80,9 @@ private[fs2] final class SocketConstants private (
     val IP_MULTICAST_IF: Int,
     val IP_MULTICAST_TTL: Int,
     val IP_MULTICAST_LOOP: Int,
+    // Linux only (-1 elsewhere): 0 so that a socket only gets the groups it joined, like the JDK
+    val IP_MULTICAST_ALL: Int,
+    val IPV6_MULTICAST_ALL: Int,
     // Linux netfilter only; -1 elsewhere.
     val SO_ORIGINAL_DST: Int,
     // IPPROTO_IPV6
@@ -187,6 +190,8 @@ private[fs2] object SocketConstants {
     IPV6_MULTICAST_HOPS = 18,
     IPV6_MULTICAST_LOOP = 19,
     IPV6_V6ONLY = 26,
+    IP_MULTICAST_ALL = 49,
+    IPV6_MULTICAST_ALL = 29,
     IPV6_JOIN_GROUP = 20,
     IPV6_LEAVE_GROUP = 21,
     MCAST_JOIN_GROUP = 42,
@@ -269,6 +274,8 @@ private[fs2] object SocketConstants {
     IPV6_MULTICAST_HOPS = 10,
     IPV6_MULTICAST_LOOP = 11,
     IPV6_V6ONLY = 27,
+    IP_MULTICAST_ALL = -1,
+    IPV6_MULTICAST_ALL = -1,
     IPV6_JOIN_GROUP = 12,
     IPV6_LEAVE_GROUP = 13,
     MCAST_JOIN_GROUP = 80,

@@ -261,4 +261,38 @@ abstract class FdPollingSuite extends Fs2Suite {
         a.connect(other.address).intercept[IllegalStateException].void
     }
   }
+
+  test(
+    "a datagram socket only gets the multicast groups it joined (Linux)".tag(udp.UdpSuite.Multicast)
+  ) {
+    assume(isLinux, "IP_MULTICAST_ALL is Linux-only")
+    val group = mip"239.10.10.11"
+    val msg = Chunk.array("hello".getBytes)
+    val reuse = List(SocketOption.reuseAddress(true))
+    Network[IO].interfaces.getAll
+      .map(
+        _.values
+          .filterNot(_.isLoopback)
+          .find(_.addresses.exists(_.address.fold(_ => true, _ => false)))
+      )
+      .flatMap { found =>
+        assume(found.isDefined, "no multicast-capable interface")
+        val out = found.get
+        Network[IO].bindDatagramSocket(SocketAddress(ip"0.0.0.0", Port.Wildcard), reuse).use {
+          joined =>
+            val port = joined.address.asIpUnsafe.port
+            (
+              Network[IO].bindDatagramSocket(SocketAddress(ip"0.0.0.0", port), reuse),
+              Network[IO].bindDatagramSocket(
+                options = List(SocketOption.multicastTtl(1), SocketOption.multicastInterface(out))
+              )
+            ).tupled.use { case (notJoined, sender) =>
+              joined.join(MulticastJoin.asm(group), out) >>
+                sender.write(msg, SocketAddress(group.address, port)) >>
+                joined.read.timeout(5.seconds).map(d => assertEquals(d.bytes, msg)) >>
+                notJoined.read.timeout(1.second).attempt.map(r => assert(r.isLeft, s"got $r"))
+            }
+        }
+      }
+  }
 }

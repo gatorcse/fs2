@@ -35,7 +35,9 @@ import scala.scalanative.unsigned._
   */
 private[fs2] object NativeSocketSyscalls extends SocketSyscalls {
   val constants: SocketConstants =
-    if (LinktimeInfo.isMac) SocketConstants.Darwin else SocketConstants.Linux
+    if (LinktimeInfo.isMac) SocketConstants.Darwin
+    else if (LinktimeInfo.isLinux) SocketConstants.Linux
+    else throw new UnsupportedOperationException("fs2's poller-based sockets need Linux or macOS")
 
   /** The shared socket logic over these syscalls. */
   lazy val sockets: FdSockets = new FdSockets(this)
