@@ -203,6 +203,8 @@ private[buffer] object NativeFile {
   @nowarn212("cat=unused")
   @extern
   private[buffer] object linux {
+    // blocking: a long copy must not hold up the other threads' stop-the-world GC.
+    @blocking
     def sendfile(outFd: CInt, inFd: CInt, offset: Ptr[CLongLong], count: CSize): CSSize = extern
   }
 }

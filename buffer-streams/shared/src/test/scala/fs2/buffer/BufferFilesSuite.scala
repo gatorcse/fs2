@@ -421,6 +421,22 @@ class BufferFilesSuite extends munit.CatsEffectSuite {
     }
   }
 
+  test("NativeChunk.heap copies re-chunked native data too") {
+    val files = BufferFiles.withAllocator[IO](checkedAllocator())
+    // A whole number of groups, so buffer emits each one before the source ends; a partial
+    // last group would come after it, which is why heap belongs before re-chunking.
+    source(10 * chunk).use { case (src, bytes) =>
+      files
+        .unsafeReadAllNative(src, chunk)
+        .buffer(2 * chunk)
+        .through(NativeChunk.heap)
+        .chunks
+        .compile
+        .toList
+        .map(cs => assertEquals(Chunk.concat(cs.map(c => Chunk.array(c.toArray))), bytes))
+    }
+  }
+
   test("cancelling a read part way releases every buffer") {
     val alloc = checkedAllocator()
     val files = BufferFiles.withAllocator[IO](alloc)

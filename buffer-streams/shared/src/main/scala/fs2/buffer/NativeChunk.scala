@@ -38,13 +38,15 @@ import scodec.bits.{BitVector, ByteVector}
   * chunks are emitted, and is released as the source fills the next one; every chunk is
   * released when the source's stream ends. So a stage needs [[toHeap]] (or the
   * [[NativeChunk.heap]] pipe) first if it:
-  *   - holds more chunks than that: `chunkN` with a large `n`, `compile.to(Chunk)`,
-  *     `groupWithin`, `sliding`;
-  *   - emits chunks after the source has ended: the last group of `chunkN`,
+  *   - holds more chunks than that: `chunkN` with a large `n`, `buffer`, `compile.to(Chunk)`,
+  *     `.chunks.compile.toList`, `groupWithin`, `sliding`;
+  *   - emits chunks after the source has ended: the last group of `chunkN`, `bufferAll`,
   *     `groupAdjacentBy`, `split`, `takeRight`;
   *   - hands chunks to another fiber: `merge`, `parEvalMap`, `parJoin`, `prefetch`,
-  *     `broadcastThrough`, `observeAsync`, `Channel`, `Topic`, or a stream run in the
-  *     background of `concurrently`.
+  *     `broadcastThrough`, `observeAsync`, `Channel`, `Topic`, fs2-io's `toInputStream`,
+  *     or a stream run in the background of `concurrently`.
+  *
+  * Put [[NativeChunk.heap]] directly after the source, before any stage that re-chunks.
   *
   * Stages that use each chunk and move on need nothing: `map`, `evalMap`, `through` a sink,
   * `observe`, `last`, `compile.toList` (which copies the bytes out), this module's writer
@@ -122,8 +124,12 @@ object NativeChunk {
     * source's window; other chunks are returned as they are.
     */
   def toHeap(c: Chunk[Byte]): Chunk[Byte] = c match {
-    case n: NativeChunk => n.toHeap
-    case other          => other
+    case n: NativeChunk            => n.toHeap
+    case a: Chunk.ArraySlice[Byte] => a
+    case s: Chunk.Singleton[Byte]  => s
+    // Anything else may wrap native chunks (a Chunk.Queue from `++`, `buffer`, `chunkMin`),
+    // so copy it whole; the copy goes through each part's checked bulk copy.
+    case other => Chunk.array(other.toArray)
   }
 
   /** A pipe that copies native chunks to the heap. Put it before any stage that holds

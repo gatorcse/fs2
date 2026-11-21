@@ -67,7 +67,7 @@ final class BufferFiles[F[_]] private (allocator: BufferAllocator)(implicit F: S
     * '''Unsafe:''' each chunk stays valid only while `window - 1` more are emitted, and
     * never after this stream ends: the file and every buffer are released at end of input
     * (or on error or cancellation). A stage that holds chunks longer, holds them past the
-    * end of the file (the last group of `chunkN`, `last`), or hands them to another fiber
+    * end of the file (the last group of `chunkN`, `takeRight`, `bufferAll`), or hands them to another fiber
     * (`merge`, `parEvalMap`, `parJoin`, `prefetch`...) must copy them with
     * [[NativeChunk.heap]] first; see [[NativeChunk]]. Use [[readAll]] unless the bytes go
     * straight on, to [[writeAll]], a hasher or a socket.
