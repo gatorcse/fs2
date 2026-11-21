@@ -136,7 +136,7 @@ private final class FdPollingDatagramSocket[F[_]: LiftIO] private (
   def disconnect: F[Unit] = writeMutex.lock.surround {
     F.delay {
       gate {
-        fds.disconnect(fd)
+        fds.disconnect(fd, domain)
         peer = null
         // Dissolving the association can unbind the socket: Linux drops a port it picked itself,
         // so, like the JDK, bind it to that port again. (macOS keeps the port but resets a

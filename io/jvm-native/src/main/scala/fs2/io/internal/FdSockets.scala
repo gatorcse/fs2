@@ -735,11 +735,14 @@ private[fs2] final class FdSockets(val sys: SocketSyscalls) {
   }
 
   /** Dissolves a datagram socket's association (`connect` to `AF_UNSPEC`). */
-  def disconnect(fd: Int): Unit = {
-    val addr = new Array[Byte](c.SockaddrIn6Size)
+  def disconnect(fd: Int, domain: Int): Unit = {
+    // macOS checks the length against the socket's family, like the JDK does
+    val addr = new Array[Byte](if (domain == c.AF_INET6) c.SockaddrIn6Size else c.SockaddrInSize)
     putFamily(addr, c.AF_UNSPEC, addr.length)
-    // BSDs report EAFNOSUPPORT, but have dissolved the association
-    guardMask(sys.connect(fd, addr, addr.length))(_ == c.EAFNOSUPPORT)
+    // BSDs dissolve the association first, then fail to connect to AF_UNSPEC
+    guardMask(sys.connect(fd, addr, addr.length)) { e =>
+      e == c.EAFNOSUPPORT || (c.isMac && (e == c.EADDRNOTAVAIL || e == EINVAL))
+    }
     ()
   }
 
