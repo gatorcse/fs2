@@ -28,21 +28,18 @@ import fs2.io.file.Path
 
 /** A file read and written through native buffers, with blocking calls. On the JVM a
   * `FileChannel` reading into and writing from direct views of the buffers, so the JDK
-  * makes no copy. Reads and writes are sequential, so pipes and devices work too.
+  * makes no copy. Reads and writes are sequential, and a read returns what one channel
+  * read gives, so pipes and devices stream as data arrives.
   */
 private[buffer] final class NativeFile private (private val ch: FileChannel) {
 
-  /** Reads into `buf` from the current position. Returns the bytes read, or -1 at EOF. */
+  /** Reads into `buf` from the current position: whatever one channel read returns, at
+    * most `buf.size` bytes. Returns the bytes read, or -1 at EOF.
+    */
   def read(buf: NativeBuf): Int = {
-    val bb = buf.asByteBuffer
-    var n = 0
-    var eof = false
-    // A file read may return short; keep going so chunks are full-size until EOF.
-    while (bb.hasRemaining && !eof) {
-      val r = ch.read(bb)
-      if (r < 0) eof = true else n += r
-    }
-    if (n == 0 && eof) -1 else n
+    // A blocking channel returns at least one byte, or -1 at end of input.
+    val r = ch.read(buf.asByteBuffer)
+    if (r <= 0) -1 else r
   }
 
   /** Writes all of `buf` at the current position. */

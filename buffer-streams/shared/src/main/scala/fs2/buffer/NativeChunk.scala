@@ -22,6 +22,8 @@
 package fs2.buffer
 
 import fs2.Chunk
+import org.typelevel.scalaccompat.annotation.nowarn212
+import scodec.bits.{BitVector, ByteVector}
 
 /** The tier-2 binary chunk: a `Chunk[Byte]` over pooled native memory.
   *
@@ -31,12 +33,21 @@ import fs2.Chunk
   * such as fs2-io's `Files.writeAll`) read the native memory directly.
   *
   * '''Lifetime.''' The source that emits it owns a rolling window of buffers (default 4). A
-  * chunk stays valid until that many more chunks have been emitted, or until the source's
-  * scope closes. A stage that holds more than that, such as `chunkN` with a large `n`, a
-  * `Channel`, a `Topic` or `prefetchN`, must call [[toHeap]] first. This is a convention
-  * the types do not enforce: with the allocator's checks on, a stale chunk throws
-  * `IllegalStateException` on bulk access (the default level) or on any access (full
-  * checks); with checks off it reads whatever the buffer holds next.
+  * chunk stays valid while `window - 1` more chunks are emitted, and is released as the
+  * source fills the next one; the last chunks stay valid until the source's scope closes. A
+  * stage that holds more than that, such as `chunkN` with a large `n`, a `Channel`, a
+  * `Topic`, `prefetchN` or `compile.to(Chunk)`, must call [[toHeap]] first.
+  *
+  * This is a convention the types do not enforce. What a stale chunk does depends on the
+  * allocator's checks level:
+  *   - Bulk (the default): bulk reads (`toArray`, `copyToArray`, `toArraySlice`,
+  *     `toByteBuffer`, `toByteVector`, writes and hashing) throw `IllegalStateException`,
+  *     but element reads (`apply`, `iterator`, `foreach`, `map`) are not checked and read
+  *     whatever the buffer holds next;
+  *   - Full: every read throws;
+  *   - Off: nothing is checked.
+  *
+  * `toByteVector` and `toBitVector` copy, since scodec-bits views are read later.
   */
 final class NativeChunk private[buffer] (
     /** The memory behind this chunk, exactly [[size]] bytes, shared with the source's lease. */
@@ -73,6 +84,15 @@ final class NativeChunk private[buffer] (
     buf.copyToArray(0, a, 0, size)
     a
   }
+
+  /** A copy: the default is a lazy view that would read the buffer after it is released. */
+  override def toByteVector[B >: Byte](implicit
+      @nowarn212("cat=unused") ev: B =:= Byte
+  ): ByteVector = ByteVector.view(toHeapArray)
+
+  override def toBitVector[B >: Byte](implicit
+      @nowarn212("cat=unused") ev: B =:= Byte
+  ): BitVector = BitVector.view(toHeapArray)
 
   override def toString: String = s"NativeChunk($buf)"
 }

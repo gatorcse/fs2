@@ -26,7 +26,7 @@ import java.io.IOException
 import scala.scalanative.libc.{errno, string}
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.posix.{fcntl, unistd}
-import scala.scalanative.posix.errno.EINTR
+import scala.scalanative.posix.errno.{EINTR, EINVAL, ENOSYS}
 import scala.scalanative.unsafe._
 import scala.scalanative.unsigned._
 
@@ -35,22 +35,24 @@ import org.typelevel.scalaccompat.annotation.nowarn212
 
 /** A file read and written through native buffers, with blocking calls: plain `read` and
   * `write` on the buffer's pointer, so nothing is copied. Reads and writes are sequential,
-  * so pipes and devices work too.
+  * and a read returns what one `read` call gives, so pipes and devices stream as data
+  * arrives.
   */
 private[buffer] final class NativeFile private (private val fd: CInt) {
 
-  /** Reads into `buf` from the current position. Returns the bytes read, or -1 at EOF. */
+  /** Reads into `buf` from the current position: whatever one `read` returns, at most
+    * `buf.size` bytes. Returns the bytes read, or -1 at EOF.
+    */
   def read(buf: NativeBuf): Int = {
     buf.bulk()
-    var n = 0
-    var eof = false
-    while (n < buf.size && !eof) {
-      val r = unistd.read(fd, buf.ptr + n, (buf.size - n).toCSize).toInt
-      if (r > 0) n += r
-      else if (r == 0) eof = true
+    var r = -1
+    var done = false
+    while (!done) {
+      r = unistd.read(fd, buf.ptr, buf.size.toCSize).toInt
+      if (r >= 0) done = true
       else if (errno.errno != EINTR) throw NativeFile.error("read")
     }
-    if (n == 0 && eof) -1 else n
+    if (r == 0) -1 else r
   }
 
   /** Writes all of `buf` at the current position. */
@@ -59,31 +61,43 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
     var n = 0
     while (n < buf.size) {
       val r = unistd.write(fd, buf.ptr + n, (buf.size - n).toCSize).toInt
-      if (r >= 0) n += r
+      if (r > 0) n += r
+      else if (r == 0) throw new IOException("write: wrote 0 bytes")
       else if (errno.errno != EINTR) throw NativeFile.error("write")
     }
   }
 
   /** Copies up to `count` bytes starting at `position` to `target`: inside the kernel with
-    * `sendfile` on Linux, through a pooled buffer elsewhere. Returns the bytes copied.
+    * `sendfile` on Linux, through a pooled buffer elsewhere or where `sendfile` refuses the
+    * pair (an `O_APPEND` target, for one). Returns the bytes copied.
     */
   def transferTo(position: Long, count: Long, target: NativeFile): Long =
     if (LinktimeInfo.isLinux) {
       val off = stackalloc[CLongLong]()
       !off = position
       var r = -1L
-      while (r < 0) {
+      var fallback = false
+      while (r < 0 && !fallback) {
         r = NativeFile.linux.sendfile(target.fd, fd, off, count.toCSize).toLong
-        if (r < 0 && errno.errno != EINTR) throw NativeFile.error("sendfile")
+        if (r < 0) {
+          val e = errno.errno
+          if (e == EINVAL || e == ENOSYS) fallback = true
+          else if (e != EINTR) throw NativeFile.error("sendfile")
+        }
       }
+      if (fallback) copyThroughBuffer(position, count, target) else r
+    } else copyThroughBuffer(position, count, target)
+
+  private def copyThroughBuffer(position: Long, count: Long, target: NativeFile): Long =
+    BufferAllocator.global.withBuffer(math.min(count, SizeClass.Bulk.toLong).toInt) { buf =>
+      var r = -1L
+      while (r < 0) {
+        r = unistd.pread(fd, buf.ptr, buf.size.toCSize, position.toSize).toLong
+        if (r < 0 && errno.errno != EINTR) throw NativeFile.error("pread")
+      }
+      if (r > 0) target.write(buf.slice(0, r.toInt))
       r
-    } else
-      BufferAllocator.global.withBuffer(math.min(count, SizeClass.Bulk.toLong).toInt) { buf =>
-        val r = unistd.pread(fd, buf.ptr, buf.size.toCSize, position.toSize).toLong
-        if (r < 0) throw NativeFile.error("pread")
-        if (r > 0) target.write(buf.slice(0, r.toInt))
-        r
-      }
+    }
 
   def size: Long = {
     val cur = unistd.lseek(fd, 0, unistd.SEEK_CUR)
@@ -93,13 +107,15 @@ private[buffer] final class NativeFile private (private val fd: CInt) {
     end.toLong
   }
 
+  // On Linux the descriptor is released even when close fails with EINTR, so that is not
+  // an error and must not be retried.
   def close(): Unit =
-    if (unistd.close(fd) != 0) throw NativeFile.error("close")
+    if (unistd.close(fd) != 0 && errno.errno != EINTR) throw NativeFile.error("close")
 }
 
 private[buffer] object NativeFile {
 
-  private final val Mode = 420.toUInt // 0644
+  private final val Mode = 438.toUInt // 0666, less the umask, as the JVM creates files
 
   def openRead(path: Path): NativeFile = open(path, fcntl.O_RDONLY)
 
